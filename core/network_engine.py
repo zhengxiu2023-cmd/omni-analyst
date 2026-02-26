@@ -11,16 +11,26 @@
 """
 
 import time
+import random
 import logging
 from typing import Optional, Iterator
 
 import requests
 import requests.exceptions
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from config import API_CONFIG
 
 # 模块级别 logger，统一由上层 utils/logger.py 配置格式
 logger = logging.getLogger(__name__)
+
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+]
 
 
 def safe_request(
@@ -45,60 +55,65 @@ def safe_request(
         超出最大重试次数后静默返回 None。
     """
     # 读取配置：重试次数和超时时间
-    max_retries: int = API_CONFIG["REQUEST_RETRIES"]
-    timeout: int = API_CONFIG["STREAM_TIMEOUT"] if stream else API_CONFIG["DEFAULT_TIMEOUT"]
+    max_retries: int = API_CONFIG.get("REQUEST_RETRIES", 3)
+    timeout: int = API_CONFIG.get("STREAM_TIMEOUT", 30) if stream else API_CONFIG.get("DEFAULT_TIMEOUT", 10)
 
-    # 如果调用方未显式传入 headers，使用 config 中的默认浏览器 UA
+    # 如果调用方未显式传入 headers，使用 config 中的默认浏览器 UA 或生成一个
     if headers is None:
-        headers = API_CONFIG["HEADERS"]
+        headers = API_CONFIG.get("HEADERS", {})
+        if "User-Agent" not in headers:
+            headers["User-Agent"] = random.choice(USER_AGENTS)
+    else:
+        # 如果传入了 headers 但没有 UA，也加上随机的 UA 以防爬
+        if "User-Agent" not in headers:
+            headers["User-Agent"] = random.choice(USER_AGENTS)
 
-    for attempt in range(max_retries):
-        try:
-            if method.lower() == "post":
-                response = requests.post(
-                    url,
-                    headers=headers,
-                    timeout=timeout,
-                    stream=stream,
-                    **kwargs,
-                )
-            else:
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    timeout=timeout,
-                    stream=stream,
-                    **kwargs,
-                )
+    # 强制抖动防爬
+    jitter = random.uniform(1.0, 3.0)
+    logger.debug(f"[网络层] 请求前强制防爬抖动 {jitter:.2f}s: {url}")
+    time.sleep(jitter)
 
-            # 4xx / 5xx 均视为错误，触发重试
-            response.raise_for_status()
-            return response
+    @retry(
+        stop=stop_after_attempt(max_retries),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        retry=retry_if_exception_type((
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.HTTPError,
+            requests.exceptions.ChunkedEncodingError,
+        )),
+        reraise=True
+    )
+    def _execute_request():
+        if method.lower() == "post":
+            response = requests.post(
+                url,
+                headers=headers,
+                timeout=timeout,
+                stream=stream,
+                **kwargs,
+            )
+        else:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=timeout,
+                stream=stream,
+                **kwargs,
+            )
+        response.raise_for_status()
+        return response
 
-        except requests.exceptions.RequestException as exc:
-            # 计算指数退避等待时间：1s -> 2s -> 4s -> ...
-            wait_seconds: float = 2 ** attempt
-
-            if attempt < max_retries - 1:
-                logger.warning(
-                    "[网络层] 第 %d/%d 次请求失败 (%s: %s)，%.0fs 后重试...",
-                    attempt + 1,
-                    max_retries,
-                    type(exc).__name__,
-                    url,
-                    wait_seconds,
-                )
-                time.sleep(wait_seconds)
-            else:
-                # 最后一次仍失败，记录错误并静默返回 None
-                logger.error(
-                    "[网络层] 已达最大重试次数 (%d)，放弃请求: %s | 原因: %s",
-                    max_retries,
-                    url,
-                    exc,
-                )
-
-    return None
+    try:
+        return _execute_request()
+    except Exception as exc:
+        logger.error(
+            "[网络层] 已达最大重试次数 (%d)，放弃请求: %s | 原因: %s",
+            max_retries,
+            url,
+            exc,
+        )
+        return None
 
 
 def stream_download(url: str, chunk_size: int = 8192) -> Iterator[bytes]:

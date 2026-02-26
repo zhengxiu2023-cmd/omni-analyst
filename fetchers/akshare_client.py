@@ -205,20 +205,21 @@ def fetch_stock_info(code: str) -> StockInfo:
     """
     多源容灾获取单只股票行情，封装为 StockInfo 对象。
 
-    数据源优先级（提取自 souji0_1.py _get_stock_info）：
-      主力源 — 东财 Push2 实时行情接口（价格/PE/PB/换手/总市值）
-      兜底源 — akshare stock_individual_info_em（仅补充名称与价格）
+    数据源优先级：
+      1. Primary: 东财 Push2 实时行情接口（价/PE/PB/换手/市值/名称）
+      2. Fallback 1: 腾讯直连接口 qt.gtimg.cn（轻量级，抗封禁极强）
+      3. Fallback 2: akshare 新浪实时行情 (stock_zh_a_spot)
+      兜底: akshare 静态名称映射
 
     Args:
         code: 6 位 A 股代码字符串（不含市场前缀）。
 
     Returns:
-        StockInfo：字段尽量填满；所有接口失败时返回 code 为名称的最小安全对象。
+        StockInfo：尽量填满；所有接口失败时返回 code 为名称的最小安全对象。
     """
-    # 预设最小安全返回值，避免外部使用 None 判断
     fallback = StockInfo(
         code=code,
-        name=code,          # 名称兜底使用代码本身
+        name=code,
         price=0.0,
         turnover=0.0,
         pe_ttm="N/A",
@@ -228,9 +229,26 @@ def fetch_stock_info(code: str) -> StockInfo:
 
     market_prefix: str = _get_market_prefix(code)
     secid: str = f"{market_prefix}.{code}"
+    
+    # 辅助闭包：补充 ROE 和毛利率
+    def _enrich_financials(obj: StockInfo):
+        try:
+            df_fin = ak.stock_financial_abstract(symbol=code)
+            if df_fin is not None and not df_fin.empty:
+                date_columns = [col for col in df_fin.columns if col not in ['选项', '指标']]
+                if date_columns:
+                    latest_col = date_columns[0]
+                    roe_row = df_fin[df_fin["指标"] == "净资产收益率(ROE)"]
+                    if not roe_row.empty:
+                        obj.roe = _safe_numeric(roe_row[latest_col].values[0])
+                    margin_row = df_fin[df_fin["指标"] == "销售毛利率"]
+                    if not margin_row.empty:
+                        obj.gross_margin = _safe_numeric(margin_row[latest_col].values[0])
+        except Exception as ex:
+            logger.warning("[财务增强] %s 获取 ROE/毛利率失败: %s", code, ex)
 
     # -------------------------------------------------------------------------
-    # 主力源：东财 Push2 实时行情（safe_request 享受防弹重试）
+    # 主力源：东财 Push2
     # -------------------------------------------------------------------------
     try:
         params = {
@@ -240,171 +258,84 @@ def fetch_stock_info(code: str) -> StockInfo:
             "fltt": 2,
             "invt": 2,
         }
-        resp = safe_request(
-            API_CONFIG["EASTMONEY_PUSH2"],
-            method="get",
-            params=params,
-            # Push2 轻量接口用完整 Headers 防反爬
-            headers=API_CONFIG["HEADERS"],
-        )
+        resp = safe_request(API_CONFIG["EASTMONEY_PUSH2"], method="get", params=params)
 
         if resp is not None:
             data: dict = resp.json().get("data") or {}
-            # f60=最新价，存在且非 None 视为有效数据
             if data.get("f60") is not None:
-                name: str = str(data.get("f58", code))
-                price: float = _safe_float(data.get("f60"))
-                turnover: float = _safe_float(data.get("f168"))
-                total_mv: float = _safe_float(data.get("f116"))
-                pe_ttm = _safe_numeric(data.get("f162"))
-                pb = _safe_numeric(data.get("f167"))
-
-                logger.info(
-                    "[行情] [Push2] %s(%s) | 价=%.2f PE=%s PB=%s 换手=%.2f%%",
-                    name, code, price, pe_ttm, pb, turnover,
-                )
                 stock_info_obj = StockInfo(
                     code=code,
-                    name=name,
-                    price=price,
-                    turnover=turnover,
-                    pe_ttm=pe_ttm,
-                    pb=pb,
-                    total_mv=total_mv,
+                    name=str(data.get("f58", code)),
+                    price=_safe_float(data.get("f60")),
+                    turnover=_safe_float(data.get("f168")),
+                    pe_ttm=_safe_numeric(data.get("f162")),
+                    pb=_safe_numeric(data.get("f167")),
+                    total_mv=_safe_float(data.get("f116")),
                 )
-                
-                # --- 新增: 补齐动态 ROE 与毛利率 ---
-                try:
-                    df_fin = ak.stock_financial_abstract(symbol=code)
-                    if df_fin is not None and not df_fin.empty:
-                        # 获取最近一期的列名，排除非日期列
-                        date_columns = [col for col in df_fin.columns if col not in ['选项', '指标']]
-                        if date_columns:
-                            latest_col = date_columns[0]
-                            
-                            roe_row = df_fin[df_fin["指标"] == "净资产收益率(ROE)"]
-                            if not roe_row.empty:
-                                val = roe_row[latest_col].values[0]
-                                stock_info_obj.roe = _safe_numeric(val)
-                                
-                            margin_row = df_fin[df_fin["指标"] == "销售毛利率"]
-                            if not margin_row.empty:
-                                val = margin_row[latest_col].values[0]
-                                stock_info_obj.gross_margin = _safe_numeric(val)
-                except Exception as ex:
-                    logger.warning("[财务指标] %s 获取 ROE/毛利率失败 (Push2阶段): %s", code, ex)
-                    
+                logger.info("[行情] [东财Primary] %s(%s) 获取成功。", stock_info_obj.name, code)
+                _enrich_financials(stock_info_obj)
                 return stock_info_obj
-
     except Exception as exc:
-        logger.warning("[行情] [Push2] %s 失败: %s", code, exc)
+        logger.warning("[行情] [东财Primary] %s 失败，准备降级: %s", code, exc)
 
     # -------------------------------------------------------------------------
-    # 二级源：akshare 实时行情快照（不走东财 Push2 反爬层，字段丰富）
+    # 备用源 1：腾讯行情接口 qt.gtimg.cn（极快且极其稳定）
     # -------------------------------------------------------------------------
     try:
-        df_spot = ak.stock_zh_a_spot_em()
-        row_match = df_spot[df_spot["代码"] == code]
-        if not row_match.empty:
-            row = row_match.iloc[0]
-            name = str(row.get("名称", code))
-            price = _safe_float(row.get("最新价"))
-            turnover = _safe_float(row.get("换手率"))
-            total_mv = _safe_float(row.get("总市值"))
-            pe_ttm = _safe_numeric(row.get("市盈率-动态"))
-            pb = _safe_numeric(row.get("市净率"))
-
-            logger.info(
-                "[行情] [akshare快照] %s(%s) | 价=%.2f PE=%s PB=%s 换手=%.2f%%",
-                name, code, price, pe_ttm, pb, turnover,
-            )
-            stock_info_obj = StockInfo(
-                code=code,
-                name=name,
-                price=price,
-                turnover=turnover,
-                pe_ttm=pe_ttm,
-                pb=pb,
-                total_mv=total_mv,
-            )
-            
-            # --- 新增: 补齐动态 ROE 与毛利率 ---
-            try:
-                df_fin = ak.stock_financial_abstract(symbol=code)
-                if df_fin is not None and not df_fin.empty:
-                    date_columns = [col for col in df_fin.columns if col not in ['选项', '指标']]
-                    if date_columns:
-                        latest_col = date_columns[0]
-                        roe_row = df_fin[df_fin["指标"] == "净资产收益率(ROE)"]
-                        if not roe_row.empty:
-                            stock_info_obj.roe = _safe_numeric(roe_row[latest_col].values[0])
-                        margin_row = df_fin[df_fin["指标"] == "销售毛利率"]
-                        if not margin_row.empty:
-                            stock_info_obj.gross_margin = _safe_numeric(margin_row[latest_col].values[0])
-            except Exception as ex:
-                logger.warning("[财务指标] %s 获取 ROE/毛利率失败 (快照阶段): %s", code, ex)
-                
-            return stock_info_obj
+        # 腾讯前缀：sh600000, sz000001
+        tx_prefix = "sh" if code.startswith(("6", "9", "5")) else "sz"
+        tx_symbol = f"{tx_prefix}{code}"
+        tx_url = f"http://qt.gtimg.cn/q={tx_symbol}"
+        
+        resp = safe_request(tx_url, method="get")
+        if resp is not None and resp.text.startswith("v_"):
+            # 格式: v_sh601318="1~中国平安~601318~52.12~..."
+            # 0:未知 1:名字 2:代码 3:当前价格 4:昨天收盘 5:开盘 6:成交量 7:外盘 8:内盘 9:买一...
+            # 37:当前价格 38:换手率 39:市盈率 43:振幅 44:流通市值 45:总市值 46:市净率
+            parts = resp.text.split("=")[1].strip('";\n').split("~")
+            if len(parts) > 46:
+                stock_info_obj = StockInfo(
+                    code=code,
+                    name=parts[1],
+                    price=_safe_float(parts[3]),
+                    turnover=_safe_float(parts[38]),
+                    pe_ttm=_safe_numeric(parts[39]),
+                    pb=_safe_numeric(parts[46]),
+                    total_mv=_safe_float(parts[45]) * 100000000, # 腾讯返回单位是亿
+                )
+                logger.info("[行情] [腾讯Fallback] %s(%s) 获取成功。", stock_info_obj.name, code)
+                _enrich_financials(stock_info_obj)
+                return stock_info_obj
     except Exception as exc:
-        logger.warning("[行情] [akshare快照] %s 失败: %s", code, exc)
+        logger.warning("[行情] [腾讯Fallback] %s 失败，准备降级: %s", code, exc)
 
     # -------------------------------------------------------------------------
-    # 三级兜底：akshare stock_individual_info_em（仅补充名称与价格）
-    # -------------------------------------------------------------------------
-    try:
-        info_df = ak.stock_individual_info_em(symbol=code)
-        if not info_df.empty:
-            name_rows = info_df[info_df["item"] == "股票简称"]
-            name = str(name_rows["value"].values[0]) if not name_rows.empty else code
-
-            price_rows = info_df[info_df["item"] == "最新"]
-            price = _safe_float(
-                price_rows["value"].values[0] if not price_rows.empty else 0
-            )
-
-            logger.info("[行情] [三级兜底] %s(%s) 名称补全完成。", name, code)
-            fallback.name = name
-            fallback.price = price
-            return fallback
-    except Exception as exc:
-        logger.error("[行情] [三级兜底] %s 失败: %s", code, exc)
-
-    # -------------------------------------------------------------------------
-    # 四级终极兜底：akshare 新浪实时行情（彻底摆脱东财限制，确保能取到名字和价格）
+    # 备用源 2：akshare 新浪接口兜底
     # -------------------------------------------------------------------------
     try:
         df_sina = ak.stock_zh_a_spot()
-        # 新浪接口的代码带有 sh/sz 前缀
         row_match = df_sina[df_sina["代码"] == secid.replace(".", "").lower()]
-        
         if not row_match.empty:
             row = row_match.iloc[0]
-            name = str(row.get("名称", code))
-            price = _safe_float(row.get("最新价"))
-
-            logger.info("[行情] [四级新浪兜底] %s(%s) 名称与价格补全完成。", name, code)
-            fallback.name = name
-            fallback.price = price
+            fallback.name = str(row.get("名称", code))
+            fallback.price = _safe_float(row.get("最新价"))
+            logger.info("[行情] [新浪Fallback] %s(%s) 仅补全名称与价格。", fallback.name, code)
+            _enrich_financials(fallback)
             return fallback
     except Exception as exc:
-        logger.error("[行情] [四级新浪兜底] %s 也失败: %s", code, exc)
+        logger.error("[行情] [新浪Fallback] %s 彻底失败: %s", code, exc)
 
     # -------------------------------------------------------------------------
-    # 五级极端兜底：本地缓存/静态映射解析名称
+    # 最终防御：静态映射 (防断网把名字抹除)
     # -------------------------------------------------------------------------
-    # 解决极端断网时，以上所有动态接口全挂，导致 fallback.name 变成代码 601318，
-    # 从而产生 `company_info/601318_601318` 这种错误文件夹，间接导致旧面板污染。
     try:
         df_map = ak.stock_info_a_code_name()
-        if not df_map.empty:
-            row_match = df_map[df_map["code"] == code]
-            if not row_match.empty:
-                name = str(row_match["name"].values[0])
-                logger.info("[行情] [五级静态兜底] %s(%s) 仅名称离线/静态解析成功。", name, code)
-                fallback.name = name
-                return fallback
-    except Exception as exc:
-        logger.error("[行情] [五级静态兜底] %s 也失败，最终只能返回最小安全对象: %s", code, exc)
+        row_match = df_map[df_map["code"] == code]
+        if not row_match.empty:
+            fallback.name = str(row_match["name"].values[0])
+            logger.info("[行情] [静态映射] %s(%s) 仅离线解析名称。", fallback.name, code)
+    except Exception:
+        pass
 
     return fallback
 
