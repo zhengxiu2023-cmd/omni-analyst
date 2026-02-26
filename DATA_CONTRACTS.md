@@ -21,6 +21,8 @@ price: float               # 最新价
 turnover: float            # 换手率 (%)
 pe_ttm: str | float        # 滚动市盈率 (缺失则为 "N/A")
 pb: str | float            # 市净率 (缺失则为 "N/A")
+roe: str | float = "N/A"   # 净资产收益率 (%)
+gross_margin: str | float = "N/A" # 毛利率 (%)
 total_mv: float            # 总市值 (元)
 # --- 以下为历史穿透字段 ---
 min_price_3y: float = 0.0  # 近3年最低价(前复权)
@@ -29,6 +31,16 @@ rise_from_bottom: float = 0.0 # 底部反弹幅度 (%)
 # --- 以下为判定状态字段 ---
 holder_trend: str = "数据缺失" # 股东户数变化趋势
 eps_forecast: str = "提取失败" # 预测 EPS
+
+1.1.1 CompetitorFinancials (竞对财报数据)
+
+@dataclass
+class CompetitorFinancials:
+code: str                  # 股票代码
+name: str                  # 股票名称
+income_statement_8q: str   # 最近 8 期利润表摘要 (营业总收入、净利润等)
+balance_sheet_8q: str      # 资产负债摘要
+经营现金流_8q: str = ""       # 经营现金流净额 (可选存入)
 
 1.2 NewsItem (情报雷达模型)
 

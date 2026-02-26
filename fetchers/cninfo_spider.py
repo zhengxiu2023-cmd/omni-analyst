@@ -101,6 +101,9 @@ def download_company_reports(
     logger.info("[巨潮] %s(%s) 全部下载任务完成。", name, code)
 
 
+# 巨潮搜索接口（替代已下线的静态全量 JSON）
+_CNINFO_SEARCH_URL: str = "http://www.cninfo.com.cn/new/information/topSearch/query"
+
 # ===========================================================================
 # 私有：获取股票 orgId（巨潮接口的必要参数）
 # ===========================================================================
@@ -109,37 +112,43 @@ def _get_org_id(code: str) -> str:
     从巨潮资讯网获取股票的 orgId。
 
     orgId 是巨潮公告检索接口的必要参数，用于精准定位公司。
-    深市（非 6 开头）查 szse 列表，沪市（6 开头）查 sse 列表。
+    旧接口 sse_stock.json 已被官方下线(404)，现改为单个并发查 topSearch/query 接口。
 
     Args:
         code: 6 位 A 股代码。
 
     Returns:
-        orgId 字符串；若查询失败返回空字符串（接口仍可降级使用空 orgId）。
+        orgId 字符串；若查询失败返回空字符串。
     """
     if code in _org_cache:
         return _org_cache[code]
 
-    # 根据股票代码选择查询的交易所列表
-    exchange_key: str = "sse" if str(code).startswith("6") else "szse"
-    list_url: str = _CNINFO_STOCK_LIST_URLS[exchange_key]
-
     try:
-        resp = safe_request(list_url, method="get")
+        resp = safe_request(
+            _CNINFO_SEARCH_URL,
+            method="post",
+            data={"keyWord": code},
+            headers=API_CONFIG["HEADERS"],
+        )
         if resp is None:
             return ""
 
-        stock_list: list[dict] = resp.json().get("stockList", [])
-        logger.debug("[巨潮] %s 股票库加载: %d 条。", exchange_key.upper(), len(stock_list))
+        results: list[dict] = resp.json()
+        if not results:
+            logger.warning("[巨潮] %s topSearch 未返回任何结果", code)
+            return ""
 
-        # 建立 code -> orgId 的映射并缓存，避免重复请求
-        for stock in stock_list:
-            stk_code: str = stock.get("code", "")
-            org_id: str = stock.get("orgId", "")
-            if stk_code:
-                _org_cache[stk_code] = org_id
+        # 精确匹配 code，提取 orgId
+        for item in results:
+            if item.get("code") == code:
+                org_id: str = item.get("orgId", "")
+                _org_cache[code] = org_id
+                return org_id
 
-        return _org_cache.get(code, "")
+        # 若未精确匹配，默认取第一条
+        org_id = results[0].get("orgId", "")
+        _org_cache[code] = org_id
+        return org_id
 
     except Exception as exc:
         logger.error("[巨潮] orgId 获取失败(%s): %s", code, exc)

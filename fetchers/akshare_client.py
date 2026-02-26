@@ -263,7 +263,7 @@ def fetch_stock_info(code: str) -> StockInfo:
                     "[行情] [Push2] %s(%s) | 价=%.2f PE=%s PB=%s 换手=%.2f%%",
                     name, code, price, pe_ttm, pb, turnover,
                 )
-                return StockInfo(
+                stock_info_obj = StockInfo(
                     code=code,
                     name=name,
                     price=price,
@@ -272,6 +272,30 @@ def fetch_stock_info(code: str) -> StockInfo:
                     pb=pb,
                     total_mv=total_mv,
                 )
+                
+                # --- 新增: 补齐动态 ROE 与毛利率 ---
+                try:
+                    df_fin = ak.stock_financial_abstract(symbol=code)
+                    if df_fin is not None and not df_fin.empty:
+                        # 获取最近一期的列名，排除非日期列
+                        date_columns = [col for col in df_fin.columns if col not in ['选项', '指标']]
+                        if date_columns:
+                            latest_col = date_columns[0]
+                            
+                            roe_row = df_fin[df_fin["指标"] == "净资产收益率(ROE)"]
+                            if not roe_row.empty:
+                                val = roe_row[latest_col].values[0]
+                                stock_info_obj.roe = _safe_numeric(val)
+                                
+                            margin_row = df_fin[df_fin["指标"] == "销售毛利率"]
+                            if not margin_row.empty:
+                                val = margin_row[latest_col].values[0]
+                                stock_info_obj.gross_margin = _safe_numeric(val)
+                except Exception as ex:
+                    logger.warning("[财务指标] %s 获取 ROE/毛利率失败 (Push2阶段): %s", code, ex)
+                    
+                return stock_info_obj
+
     except Exception as exc:
         logger.warning("[行情] [Push2] %s 失败: %s", code, exc)
 
@@ -294,7 +318,7 @@ def fetch_stock_info(code: str) -> StockInfo:
                 "[行情] [akshare快照] %s(%s) | 价=%.2f PE=%s PB=%s 换手=%.2f%%",
                 name, code, price, pe_ttm, pb, turnover,
             )
-            return StockInfo(
+            stock_info_obj = StockInfo(
                 code=code,
                 name=name,
                 price=price,
@@ -303,6 +327,24 @@ def fetch_stock_info(code: str) -> StockInfo:
                 pb=pb,
                 total_mv=total_mv,
             )
+            
+            # --- 新增: 补齐动态 ROE 与毛利率 ---
+            try:
+                df_fin = ak.stock_financial_abstract(symbol=code)
+                if df_fin is not None and not df_fin.empty:
+                    date_columns = [col for col in df_fin.columns if col not in ['选项', '指标']]
+                    if date_columns:
+                        latest_col = date_columns[0]
+                        roe_row = df_fin[df_fin["指标"] == "净资产收益率(ROE)"]
+                        if not roe_row.empty:
+                            stock_info_obj.roe = _safe_numeric(roe_row[latest_col].values[0])
+                        margin_row = df_fin[df_fin["指标"] == "销售毛利率"]
+                        if not margin_row.empty:
+                            stock_info_obj.gross_margin = _safe_numeric(margin_row[latest_col].values[0])
+            except Exception as ex:
+                logger.warning("[财务指标] %s 获取 ROE/毛利率失败 (快照阶段): %s", code, ex)
+                
+            return stock_info_obj
     except Exception as exc:
         logger.warning("[行情] [akshare快照] %s 失败: %s", code, exc)
 
