@@ -117,11 +117,13 @@ def fetch_radar_news() -> list[NewsItem]:
         end_d: str = datetime.now().strftime("%Y%m%d")
         df_lhb = ak.stock_lhb_jgmmtj_em(start_date=start_d, end_date=end_d)
 
+        lhb_matched: int = 0  # 用局部计数变量，避免 df_lhb 为空时 hot_lhb 未定义
         if not df_lhb.empty:
             df_lhb["机构净买额"] = pd.to_numeric(df_lhb["机构净买额"], errors="coerce")
             # 筛选机构净买入超过 6000 万的标的
             threshold: float = 6_000_0000  # 6000 万元（单位：元）
             hot_lhb = df_lhb[df_lhb["机构净买额"] > threshold].head(5)
+            lhb_matched = len(hot_lhb)
             for _, row in hot_lhb.iterrows():
                 name: str = str(row.get("股票名称", ""))
                 code: str = str(row.get("股票代码", ""))
@@ -138,7 +140,7 @@ def fetch_radar_news() -> list[NewsItem]:
                         score=2,
                     )
                 )
-        logger.info("[雷达] 龙虎榜: 命中 %d 条。", len(hot_lhb) if not df_lhb.empty else 0)
+        logger.info("[雷达] 龙虎榜: 命中 %d 条。", lhb_matched)
     except Exception as exc:
         logger.warning("[雷达] 龙虎榜接口失败: %s", exc)
 
@@ -404,9 +406,12 @@ def fetch_kline_extremes(code: str, stock_info: StockInfo) -> StockInfo:
             max_turnover_5d: float = max(turnovers[-5:])
             death_threshold: float = RISK_THRESHOLDS["DEATH_TURNOVER_PCT"]
 
-            # ST /* 北交所 */ 名称中含 N/C 的新股本身换手率极高，不触发警告
-            is_new_or_st: bool = any(
-                tag in stock_info.name for tag in ("ST", "N", "C")
+            # 排除新股（沪深新股名称以大写 N/C 开头）和 ST 股，换手率规律特殊
+            name_upper: str = stock_info.name.upper()
+            is_new_or_st: bool = (
+                name_upper.startswith("N")
+                or name_upper.startswith("C")
+                or "ST" in stock_info.name
             )
 
             if max_turnover_5d > death_threshold and not is_new_or_st:
