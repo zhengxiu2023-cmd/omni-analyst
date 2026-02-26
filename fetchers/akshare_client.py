@@ -325,7 +325,27 @@ def fetch_stock_info(code: str) -> StockInfo:
             fallback.price = price
             return fallback
     except Exception as exc:
-        logger.error("[行情] [三级兜底] %s 也失败，返回最小安全对象: %s", code, exc)
+        logger.error("[行情] [三级兜底] %s 失败: %s", code, exc)
+
+    # -------------------------------------------------------------------------
+    # 四级终极兜底：akshare 新浪实时行情（彻底摆脱东财限制，确保能取到名字和价格）
+    # -------------------------------------------------------------------------
+    try:
+        df_sina = ak.stock_zh_a_spot()
+        # 新浪接口的代码带有 sh/sz 前缀
+        row_match = df_sina[df_sina["代码"] == secid.replace(".", "").lower()]
+        
+        if not row_match.empty:
+            row = row_match.iloc[0]
+            name = str(row.get("名称", code))
+            price = _safe_float(row.get("最新价"))
+
+            logger.info("[行情] [四级新浪兜底] %s(%s) 名称与价格补全完成。", name, code)
+            fallback.name = name
+            fallback.price = price
+            return fallback
+    except Exception as exc:
+        logger.error("[行情] [四级新浪兜底] %s 也失败，返回最小安全对象: %s", code, exc)
 
     return fallback
 
