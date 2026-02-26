@@ -171,7 +171,13 @@ def _download_category(
         use_investor_filter: 是否启用 INVESTOR_DOC_KEYWORDS 精准后过滤（针对调研纪要）。
     """
     org_id: str = _get_org_id(code)
-    # stock 参数格式为 "code,orgId"（orgId 为空时巨潮接口降级处理仍可用）
+    # orgId 为空时巨潮接口会返回随机公司公告——必须拒绝！
+    if not org_id:
+        logger.warning(
+            "[巨潮] %s(%s) orgId 获取失败，跳过该类别下载（防止下载错误公司公告）。",
+            name, code,
+        )
+        return
     stock_param: str = f"{code},{org_id}"
 
     # 根据代码自动适配交易所列（szse=深交所，sse=上交所）
@@ -217,6 +223,12 @@ def _download_category(
         adjunct_url: str = ann.get("adjunctUrl", "")
 
         if not adjunct_url:
+            continue
+
+        # 二次校验：确保公告的 secCode 属于目标股（防止接口返回不相关公告）
+        ann_code: str = str(ann.get("secCode", ""))
+        if ann_code and ann_code != code:
+            logger.debug("[巨潮] 跳过非目标股公告: secCode=%s != %s | %s", ann_code, code, raw_title[:40])
             continue
 
         # ── 过滤噪音公告 ──

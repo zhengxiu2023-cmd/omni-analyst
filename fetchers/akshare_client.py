@@ -276,7 +276,38 @@ def fetch_stock_info(code: str) -> StockInfo:
         logger.warning("[行情] [Push2] %s 失败: %s", code, exc)
 
     # -------------------------------------------------------------------------
-    # 兜底源：akshare stock_individual_info_em（仅补充名称与价格）
+    # 二级源：akshare 实时行情快照（不走东财 Push2 反爬层，字段丰富）
+    # -------------------------------------------------------------------------
+    try:
+        df_spot = ak.stock_zh_a_spot_em()
+        row_match = df_spot[df_spot["代码"] == code]
+        if not row_match.empty:
+            row = row_match.iloc[0]
+            name = str(row.get("名称", code))
+            price = _safe_float(row.get("最新价"))
+            turnover = _safe_float(row.get("换手率"))
+            total_mv = _safe_float(row.get("总市值"))
+            pe_ttm = _safe_numeric(row.get("市盈率-动态"))
+            pb = _safe_numeric(row.get("市净率"))
+
+            logger.info(
+                "[行情] [akshare快照] %s(%s) | 价=%.2f PE=%s PB=%s 换手=%.2f%%",
+                name, code, price, pe_ttm, pb, turnover,
+            )
+            return StockInfo(
+                code=code,
+                name=name,
+                price=price,
+                turnover=turnover,
+                pe_ttm=pe_ttm,
+                pb=pb,
+                total_mv=total_mv,
+            )
+    except Exception as exc:
+        logger.warning("[行情] [akshare快照] %s 失败: %s", code, exc)
+
+    # -------------------------------------------------------------------------
+    # 三级兜底：akshare stock_individual_info_em（仅补充名称与价格）
     # -------------------------------------------------------------------------
     try:
         info_df = ak.stock_individual_info_em(symbol=code)
@@ -289,12 +320,12 @@ def fetch_stock_info(code: str) -> StockInfo:
                 price_rows["value"].values[0] if not price_rows.empty else 0
             )
 
-            logger.info("[行情] [兜底源] %s(%s) 名称补全完成。", name, code)
+            logger.info("[行情] [三级兜底] %s(%s) 名称补全完成。", name, code)
             fallback.name = name
             fallback.price = price
             return fallback
     except Exception as exc:
-        logger.error("[行情] [兜底源] %s 也失败，返回最小安全对象: %s", code, exc)
+        logger.error("[行情] [三级兜底] %s 也失败，返回最小安全对象: %s", code, exc)
 
     return fallback
 
