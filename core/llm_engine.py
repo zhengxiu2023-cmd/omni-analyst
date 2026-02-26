@@ -14,6 +14,7 @@
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -150,7 +151,13 @@ def _parse_llm_response(raw_text: str) -> LLMScore:
         return LLMScore(reasoning="模型返回内容为空")
 
     try:
-        data: dict = json.loads(raw_text)
+        # 抗幻觉防御：如果小模型依然输出了 ```json ... ``` 块，正则剥离掉它
+        clean_text = raw_text.strip()
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", clean_text, re.DOTALL)
+        if match:
+            clean_text = match.group(1).strip()
+            
+        data: dict = json.loads(clean_text)
 
         # 提取 score，并强制约束在 [0, 2] 区间
         raw_score = data.get("score", 0)
