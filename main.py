@@ -204,7 +204,7 @@ def _export_daily_report(items: list[NewsItem]) -> None:
     lines: list[str] = [
         f"# 📡 每日超景气 Alpha 核心情报简报",
         f"**生成时间:** {date_str}",
-        f"**初筛引擎:** Omni-Analyst v7.5 (Local {'Qwen2.5:7b' if _USE_LLM else '物理正则降级'})",
+        f"**初筛引擎:** Omni-Analyst v7.5 (Local {config.LLM_CONFIG['MODEL_NAME'] if _USE_LLM else '物理正则降级'})",
         "",
         ("> **To The Hyper-Prosperity Auditor (云端大模型):** 以下情报已通过本地物理/神经双引擎过滤，"
          "去除了垃圾噪音。请依据《超景气价值投机》框架，对以下信息进行二阶与三阶推演，"

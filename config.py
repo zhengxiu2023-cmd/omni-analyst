@@ -138,7 +138,7 @@ EM_MARKET_SECIDS: str = "1.000001,0.399001,1.000016,0.399006"
 LLM_CONFIG: dict = {
     "ENABLE": True,
     "OLLAMA_API": "http://localhost:11434/api/generate",
-    "MODEL_NAME": "qwen2.5:7b",
+    "MODEL_NAME": "qwen3:8b",
     "TIMEOUT": 5.0,    # 给予 LLM 充足的思考时间 (秒)
     "SYSTEM_PROMPT": """你是一个冷酷的"超景气价值投机"情报过滤引擎。你的任务是鉴别输入的新闻/情报是否具备真实的爆炸性价值。
 请严格按照以下标准进行评分，并给出极其简短的理由：
