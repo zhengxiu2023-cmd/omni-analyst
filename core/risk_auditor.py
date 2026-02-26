@@ -196,12 +196,13 @@ def generate_panel_markdown(
                 f"{stock_info.min_price_3y:.2f} 元 "
                 f"(自底部已反弹 {stock_info.rise_from_bottom:.1f}%)"
                 f"{risk_status.extreme_rise_warn}"
-            ),
+            ) if stock_info.min_price_3y > 0 else "[K线接口异常，历史数据待下次刷新]",
             "high" if stock_info.min_price_3y > 0 else "low",
         ),
         (
             "当前价格历史分位 (Price_Percentile)",
-            f"{stock_info.price_percentile:.1f}%",
+            f"{stock_info.price_percentile:.1f}%" if stock_info.min_price_3y > 0
+            else "[K线接口异常，分位数据待下次刷新]",
             "high" if stock_info.min_price_3y > 0 else "low",
         ),
         (

@@ -244,8 +244,8 @@ def fetch_stock_info(code: str) -> StockInfo:
             API_CONFIG["EASTMONEY_PUSH2"],
             method="get",
             params=params,
-            # Push2 轻量接口用更短的自定义超时覆盖流式超时
-            headers={"User-Agent": "Mozilla/5.0"},
+            # Push2 轻量接口用完整 Headers 防反爬
+            headers=API_CONFIG["HEADERS"],
         )
 
         if resp is not None:
@@ -344,7 +344,7 @@ def fetch_kline_extremes(code: str, stock_info: StockInfo) -> StockInfo:
             API_CONFIG["EASTMONEY_KLINE"],
             method="get",
             params=params,
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers=API_CONFIG["HEADERS"],
         )
 
         if resp is None:
@@ -455,7 +455,7 @@ def fetch_market_volume() -> float:
             API_CONFIG["EASTMONEY_MARKET_VOL"],
             method="get",
             params=params,
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers=API_CONFIG["HEADERS"],
         )
 
         if resp is None:
