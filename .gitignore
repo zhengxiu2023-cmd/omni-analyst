@@ -1,0 +1,32 @@
+# Python 字节码与缓存
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 项目产出物（下载的 PDF 和参数面板，不纳入版本控制）
+company_info/
+
+# IDE 与系统文件
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 旧版遗留代码（已完成价值提取，仅做归档参考，不参与新架构构建）
+# souji0_1.py
+
+# 本地模型权重等大文件（如有）
+*.bin
+*.safetensors
