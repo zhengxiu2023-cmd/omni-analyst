@@ -345,7 +345,24 @@ def fetch_stock_info(code: str) -> StockInfo:
             fallback.price = price
             return fallback
     except Exception as exc:
-        logger.error("[行情] [四级新浪兜底] %s 也失败，返回最小安全对象: %s", code, exc)
+        logger.error("[行情] [四级新浪兜底] %s 也失败: %s", code, exc)
+
+    # -------------------------------------------------------------------------
+    # 五级极端兜底：本地缓存/静态映射解析名称
+    # -------------------------------------------------------------------------
+    # 解决极端断网时，以上所有动态接口全挂，导致 fallback.name 变成代码 601318，
+    # 从而产生 `company_info/601318_601318` 这种错误文件夹，间接导致旧面板污染。
+    try:
+        df_map = ak.stock_info_a_code_name()
+        if not df_map.empty:
+            row_match = df_map[df_map["code"] == code]
+            if not row_match.empty:
+                name = str(row_match["name"].values[0])
+                logger.info("[行情] [五级静态兜底] %s(%s) 仅名称离线/静态解析成功。", name, code)
+                fallback.name = name
+                return fallback
+    except Exception as exc:
+        logger.error("[行情] [五级静态兜底] %s 也失败，最终只能返回最小安全对象: %s", code, exc)
 
     return fallback
 
