@@ -13,6 +13,9 @@ import os
 import pandas as pd
 import akshare as ak
 from typing import List, Tuple
+import time
+import random
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config import EXPORT_CONFIG
 
@@ -30,55 +33,68 @@ def _safe_float_str(val, default="N/A") -> str:
     except (ValueError, TypeError):
         return default
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1.5, min=2, max=10),
+    reraise=True
+)
 def _get_target_industry_peers(stock_code: str, top_n: int = 2) -> Tuple[List[dict], str]:
     """
     寻找同板块市值最近的竞对标的，并返回板块名称。
     """
+    peers = []  # Initialize early to prevent NameError in except blocks
     try:
-        # 获取标的基本信息以确定板块
-        info_df = ak.stock_individual_info_em(symbol=stock_code)
-        if info_df.empty:
-            return [], ""
-            
-        industry_row = info_df[info_df["item"] == "行业"]
-        if industry_row.empty:
-            return [], ""
-            
-        industry_name = str(industry_row["value"].values[0])
-        
-        # 获取板块内所有成分股
-        cons_df = ak.stock_board_industry_cons_em(symbol=industry_name)
-        if cons_df.empty:
-            return [], industry_name
-            
-        # 寻找目标公司的市值 (假设使用总市值进行找平)
-        target_row = cons_df[cons_df["代码"] == stock_code]
-        if target_row.empty:
-            return []
-            
-        target_mv = target_row["总市值"].values[0]
-        
-        # 将除去自己之外的同业按市值偏离度排序
-        peers_df = cons_df[cons_df["代码"] != stock_code].copy()
-        
-        if peers_df.empty:
-            return []
-            
-        peers_df.loc[:, "mv_diff"] = abs(peers_df["总市值"] - target_mv)
-        peers_df = peers_df.sort_values(by="mv_diff").head(top_n)
-        
-        peers = []
-        for _, row in peers_df.iterrows():
-            peers.append({
-                "code": str(row["代码"]),
-                "name": str(row["名称"])
-            })
-            
-        logger.info("[竞对发现] %s 属于板块 '%s', 找到贴身竞对: %s", stock_code, industry_name, [p["name"] for p in peers])
-        return peers, industry_name
+        # 强制防爬阻断休眠
+        time.sleep(random.uniform(2.0, 4.0))
+        try:
+            # 获取标的基本信息以确定东财板块
+            info_df = ak.stock_individual_info_em(symbol=stock_code)
+            if not info_df.empty:
+                industry_row = info_df[info_df["item"] == "行业"]
+                if not industry_row.empty:
+                    industry_name = str(industry_row["value"].values[0])
+                    # 获取板块内所有成分股
+                    cons_df = ak.stock_board_industry_cons_em(symbol=industry_name)
+                    if not cons_df.empty:
+                        # 寻找目标公司的市值 (假设使用总市值进行找平)
+                        target_row = cons_df[cons_df["代码"] == stock_code]
+                        if not target_row.empty:
+                            target_mv = target_row["总市值"].values[0]
+                            # 将除去自己之外的同业按市值偏离度排序
+                            peers_df = cons_df[cons_df["代码"] != stock_code].copy()
+                            if not peers_df.empty:
+                                peers_df.loc[:, "mv_diff"] = abs(peers_df["总市值"] - target_mv)
+                                peers_df = peers_df.sort_values(by="mv_diff").head(top_n)
+                                
+                                for _, row in peers_df.iterrows():
+                                    peers.append({
+                                        "code": str(row["代码"]),
+                                        "name": str(row["名称"])
+                                    })
+                                    
+                                logger.info("[竞对发现] %s 属于东财板块 '%s', 找到贴身竞对: %s", stock_code, industry_name, [p["name"] for p in peers])
+                                return peers, industry_name
+        except Exception as em_exc:
+            logger.warning("[竞对发现] 东财接口提取竞对失败，降级尝试同花顺(THS)机制: %s", em_exc)
+
+        # -------------------------------------------------------------
+        # 兜底机制：同花顺 (THS) 行业与成分股
+        # -------------------------------------------------------------
+        try:
+            # 简化版同花顺兜底：直接提取板块数据
+            ths_board_df = ak.stock_board_industry_name_ths()
+            if ths_board_df is not None and not ths_board_df.empty:
+                # 为了防爆主流程并且确保性能，一旦东财接口崩溃，且为了彻底消灭幻觉兜底：
+                # 我们不再伪造 THS 数据，而是直接安全向下传递空数组，面板通过 Markdown 优雅降级。
+                logger.info("[竞对发现] 东财获取竞对崩溃，THS兜底亦不再伪造对象，触发最高级别空值降级主流程...")
+                return [], ""
+        except Exception as ths_exc:
+            logger.warning("[竞对发现] 同花顺接口兜底同样失败: %s", ths_exc)
+
+        return [], ""
         
     except Exception as exc:
-        logger.warning("[竞对发现] 寻找 %s 的竞对失败: %s", stock_code, exc)
+        logger.error("[竞对发现-系统级保护] 寻找 %s 的竞对彻底崩溃，安全阻断: %s", stock_code, exc)
         return [], ""
 
 def _fetch_single_8q(stock_code: str) -> dict:
@@ -154,21 +170,12 @@ def _fetch_single_8q(stock_code: str) -> dict:
         
     return result
 
-def fetch_target_and_peers_financials(target_code: str, save_dir: str = None) -> List[CompetitorFinancials]:
+def fetch_target_and_peers_financials(target_code: str, target_name: str, save_dir: str = None) -> Tuple[List[CompetitorFinancials], List[str]]:
     """
     拉取目标公司及其 1-2 位板块竞对的最近 8 期主要财务表指标，并联动下载目标、竞对及行业板块高价值深度研报。防爆捕获，失败不可阻断主流程。
     """
     final_results: List[CompetitorFinancials] = []
-    
-    # 获取目标自身名称
-    target_name = target_code
-    try:
-        df_name = ak.stock_info_a_code_name()
-        match = df_name[df_name["code"] == target_code]
-        if not match.empty:
-            target_name = str(match["name"].values[0])
-    except:
-        pass
+    industry_reports_text: List[str] = []
 
     # 1. 解析目标股的 8 期
     target_data = _fetch_single_8q(target_code)
@@ -180,9 +187,12 @@ def fetch_target_and_peers_financials(target_code: str, save_dir: str = None) ->
         cash_flow_8q=target_data.get("cash_flow_8q", [])
     ))
     
-    # 下载目标自身的研报 PDF
+    # 下载目标自身的研报 PDF，沙盒隔离
     if save_dir:
-        download_company_reports(target_code, target_name, save_dir, is_rival=False)
+        try:
+            download_company_reports(target_code, target_name, save_dir, is_rival=False)
+        except Exception as e:
+            logger.error("[容灾] 目标自身 PDF 下载异常: %s", e)
         
     # 2. 挖掘竞对并提取 8 期
     peers, industry_name = _get_target_industry_peers(target_code, top_n=2)
@@ -200,9 +210,12 @@ def fetch_target_and_peers_financials(target_code: str, save_dir: str = None) ->
                 cash_flow_8q=peer_data.get("cash_flow_8q", [])
             ))
             
-            # 下载竞对的研报 PDF
+            # 下载竞对的研报 PDF，沙盒隔离
             if save_dir:
-                download_company_reports(peer_code, peer_name, save_dir, is_rival=True)
+                try:
+                    download_company_reports(peer_code, peer_name, save_dir, is_rival=True)
+                except Exception as e:
+                    logger.error("[容灾] 竞对 %s PDF 下载异常: %s", peer_name, e)
         except Exception as exc:
             logger.warning("[竞对抓取] 提取竞对 %s(%s) 失败，已沙盒隔离防崩溃: %s", peer_name, peer_code, exc)
             continue
@@ -211,4 +224,27 @@ def fetch_target_and_peers_financials(target_code: str, save_dir: str = None) ->
     if save_dir and industry_name:
         download_industry_reports(industry_name, save_dir, limit=3)
         
-    return final_results
+        # V8.4.2 行业研报纯文本化
+        try:
+            ak_func = getattr(ak, "stock_research_report_industry_em", None)
+            if ak_func is not None:
+                df_ind = ak_func(symbol=industry_name)
+                if df_ind is not None and not df_ind.empty:
+                    for _, row in df_ind.head(3).iterrows():
+                        title = row.get("title", "") or row.get("文章简称", "")
+                        summary = row.get("summary", "") or row.get("内容摘要", "")
+                        if title:
+                            industry_reports_text.append(f"**{title}**: {summary[:100]}...")
+            else:
+                # 尝试用通用的研究报告退化兜底
+                df_em = ak.stock_research_report_em(symbol=target_code)
+                if df_em is not None and not df_em.empty:
+                    for _, row in df_em.head(3).iterrows():
+                        title = row.get("title", "") or row.get("文章简称", "")
+                        summary = row.get("summary", "") or row.get("内容摘要", "")
+                        if title:
+                            industry_reports_text.append(f"**{title}**: {summary[:100]}...")
+        except Exception as e:
+            logger.warning("[行业研报] 获取纯文本研报摘要失败: %s", e)
+        
+    return final_results, industry_reports_text

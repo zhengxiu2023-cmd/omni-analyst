@@ -32,6 +32,7 @@ from config import (
 )
 from core.models import NewsItem, StockInfo
 from core.network_engine import safe_request
+from fetchers.tdx_client import get_tdx_quotes, get_tdx_kline_bars
 
 logger = logging.getLogger(__name__)
 
@@ -247,8 +248,141 @@ def fetch_stock_info(code: str) -> StockInfo:
         except Exception as ex:
             logger.warning("[财务增强] %s 获取 ROE/毛利率失败: %s", code, ex)
 
+    # 辅助闭包：补充预期 EPS 和 股东户数
+    def _enrich_advanced_fundamentals(obj: StockInfo):
+        # 1. EPS 预测提取
+        try:
+            df_profit = ak.stock_profit_forecast()
+            if df_profit is not None and not df_profit.empty:
+                df_target = df_profit[df_profit["代码"] == code]
+                if not df_target.empty:
+                    current_year = datetime.now().year
+                    eps_strings = []
+                    df_target = df_target.sort_values(by="预测年份")
+                    for _, row in df_target.iterrows():
+                        pred_year = _safe_float(row.get("预测年份", 0))
+                        if pred_year >= current_year:
+                            eps_val = _safe_float(row.get("每股收益", 0))
+                            if eps_val > 0:
+                                eps_strings.append(f"{int(pred_year)}E: {eps_val:.2f}元")
+                            if len(eps_strings) >= 2:
+                                break
+                    if eps_strings:
+                        obj.eps_forecast = ", ".join(eps_strings)
+                    else:
+                        obj.eps_forecast = "无研报覆盖"
+                else:
+                    obj.eps_forecast = "无研报覆盖"
+        except Exception as e:
+            logger.warning("[EPS预测] %s 获取失败: %s", code, e)
+
+        # 2. 股东户数提取
+        try:
+            df_gdhs = ak.stock_zh_a_gdhs(symbol=code)
+            if df_gdhs is not None and not df_gdhs.empty:
+                if "数据日期" in df_gdhs.columns:
+                    df_gdhs = df_gdhs.sort_values(by="数据日期", ascending=False)
+                if len(df_gdhs) >= 2:
+                    current_holders = _safe_float(df_gdhs.iloc[0].get("本次户数", 0))
+                    prev_holders = _safe_float(df_gdhs.iloc[1].get("本次户数", 0))
+                    if current_holders > 0 and prev_holders > 0:
+                        change_pct = (current_holders - prev_holders) / prev_holders * 100
+                        trend_desc = "筹码分散" if change_pct > 0 else "筹码集中"
+                        obj.holder_trend = f"最新 {current_holders / 10000:.1f}万户，较上期{'增加' if change_pct > 0 else '下降'} {abs(change_pct):.1f}% ({trend_desc})"
+                elif len(df_gdhs) == 1:
+                    current_holders = _safe_float(df_gdhs.iloc[0].get("本次户数", 0))
+                    obj.holder_trend = f"最新 {current_holders / 10000:.1f}万户 (无上期数据比对)"
+        except Exception as e:
+            logger.warning("[股东户数] %s 获取失败: %s", code, e)
+
     # -------------------------------------------------------------------------
-    # 主力源：腾讯行情接口 qt.gtimg.cn（极快且极其稳定）
+    # ★ 主力源 (V8.4): PyTDX TCP 直连券商主站（降维打击，无视 HTTP WAF）
+    # -------------------------------------------------------------------------
+    try:
+        tdx_data = get_tdx_quotes(code)
+        if tdx_data is not None and tdx_data.get("price", 0) > 0:
+            # TDX 不含股票名称，优先走新浪轻量接口静默提取
+            tdx_name = code
+            try:
+                market_prefix = "sh" if str(code).startswith(("6", "9", "5")) else "sz"
+                sina_url = f"http://hq.sinajs.cn/list={market_prefix}{code}"
+                from core.network_engine import safe_request
+                resp = safe_request(sina_url, method="get", headers={"Referer": "https://finance.sina.com.cn"})
+                if resp is not None and resp.status_code == 200:
+                    text = resp.text
+                    if '="' in text:
+                        data_part = text.split('="')[1]
+                        if ',' in data_part:
+                            tdx_name = data_part.split(',')[0].strip()
+            except Exception as e:
+                logger.warning("[TDX补齐] %s 新浪接口获取名称失败: %s", code, e)
+
+            # 如仍未获取，尝试从 akshare 静态表获取兜底
+            if tdx_name == code or not tdx_name:
+                try:
+                    df_map = ak.stock_info_a_code_name()
+                    match = df_map[df_map["code"] == code]
+                    if not match.empty:
+                        tdx_name = str(match["name"].values[0])
+                except Exception:
+                    pass
+            
+            # TDX 不含 PE/PB，尝试从东财获取估值数据补齐
+            pe_val = "N/A"
+            pb_val = "N/A"
+            turnover_val = 0.0
+            total_mv_val = 0.0
+            try:
+                info_df = ak.stock_individual_info_em(symbol=code)
+                if info_df is not None and not info_df.empty:
+                    def _extract_info(df, item_name):
+                        row = df[df["item"] == item_name]
+                        return row["value"].values[0] if not row.empty else None
+                    pe_val = _safe_numeric(_extract_info(info_df, "市盈率(动态)"))
+                    pb_val = _safe_numeric(_extract_info(info_df, "市净率"))
+                    total_mv_raw = _extract_info(info_df, "总市值")
+                    if total_mv_raw is not None:
+                        total_mv_val = _safe_float(total_mv_raw)
+                    turnover_raw = _extract_info(info_df, "换手率")
+                    if turnover_raw is not None:
+                        turnover_val = _safe_float(turnover_raw)
+            except Exception as ex:
+                logger.debug("[TDX补齐] %s 东财拉取指标失败，将交由腾讯兜底: %s", code, ex)
+                
+            # --- 估值补齐：腾讯直连硬解 (PE/PB) ---
+            if pe_val == "N/A" or pb_val == "N/A":
+                try:
+                    tx_prefix = "sh" if code.startswith(("6", "9", "5")) else "sz"
+                    tx_url = f"http://qt.gtimg.cn/q={tx_prefix}{code}"
+                    resp = safe_request(tx_url, method="get")
+                    if resp is not None and resp.text.startswith("v_"):
+                        parts = resp.text.split("=")[1].strip('";\n').split("~")
+                        if len(parts) > 46:
+                            if pe_val == "N/A":
+                                pe_val = _safe_numeric(parts[39])
+                            if pb_val == "N/A":
+                                pb_val = _safe_numeric(parts[46])
+                except Exception as ex:
+                    logger.debug("[TDX补齐] %s 腾讯接口补充 PE/PB 失败: %s", code, ex)
+            
+            stock_info_obj = StockInfo(
+                code=code,
+                name=tdx_name,
+                price=tdx_data["price"],
+                turnover=turnover_val,
+                pe_ttm=pe_val,
+                pb=pb_val,
+                total_mv=total_mv_val,
+            )
+            logger.info("[行情] [★ PyTDX直连] %s(%s) 获取成功。", stock_info_obj.name, code)
+            _enrich_financials(stock_info_obj)
+            _enrich_advanced_fundamentals(stock_info_obj)
+            return stock_info_obj
+    except Exception as exc:
+        logger.warning("[行情] [PyTDX直连] %s 失败，降级到腾讯 HTTP: %s", code, exc)
+
+    # -------------------------------------------------------------------------
+    # Fallback 1: 腾讯行情接口 qt.gtimg.cn（HTTP 轻量级，抗封禁较强）
     # -------------------------------------------------------------------------
     try:
         # 腾讯前缀：sh600000, sz000001
@@ -303,7 +437,7 @@ def fetch_stock_info(code: str) -> StockInfo:
         logger.warning("[行情] [新浪Fallback] %s 失败，准备降级: %s", code, exc)
 
     # -------------------------------------------------------------------------
-    # 备用源 2：东财 Push2 (最容易遭遇 RemoteDisconnected 的源，放到最后防抖)
+    # Fallback 3: 东财 Push2 (最容易遭遇 RemoteDisconnected 的源，放到最后防抖)
     # -------------------------------------------------------------------------
     try:
         params = {
@@ -396,84 +530,105 @@ def fetch_kline_extremes(code: str, stock_info: StockInfo) -> StockInfo:
             headers=API_CONFIG["HEADERS"],
         )
 
-        if resp is None:
-            logger.warning("[K线] %s: safe_request 返回 None，跳过历史分位计算。", code)
-            return stock_info
+        if resp is not None:
+            kline_data: dict = resp.json().get("data") or {}
+            klines: list[str] = kline_data.get("klines") or []
 
-        kline_data: dict = resp.json().get("data") or {}
-        klines: list[str] = kline_data.get("klines") or []
+            if klines:
+                # 解析 K 线：每条格式为 "日期,开,收,高,低,量,额,振幅,涨跌幅,涨跌额,换手"
+                lows: list[float] = []
+                highs: list[float] = []
+                turnovers: list[float] = []
 
-        if not klines:
-            logger.warning("[K线] %s: 无 K 线数据（%d 条），跳过分位计算。", code, len(klines))
-            return stock_info
+                for kline in klines:
+                    parts = kline.split(",")
+                    if len(parts) < 11:
+                        continue
+                    lows.append(_safe_float(parts[4]))
+                    highs.append(_safe_float(parts[3]))
+                    turnovers.append(_safe_float(parts[10]))
 
-        # 解析 K 线：每条格式为 "日期,开,收,高,低,量,额,振幅,涨跌幅,涨跌额,换手"
-        # 索引：  0   1  2  3  4  5  6   7    8    9    10
-        lows: list[float] = []
-        highs: list[float] = []
-        turnovers: list[float] = []
+                if lows:
+                    p_now: float = stock_info.price
+                    p_min_3y: float = min(lows)
+                    p_max_3y: float = max(highs)
 
-        for kline in klines:
-            parts = kline.split(",")
-            if len(parts) < 11:
-                continue
-            lows.append(_safe_float(parts[4]))
-            highs.append(_safe_float(parts[3]))
-            turnovers.append(_safe_float(parts[10]))
+                    price_percentile: float = (
+                        (p_now - p_min_3y) / (p_max_3y - p_min_3y) * 100
+                        if p_max_3y != p_min_3y
+                        else 0.0
+                    )
+                    rise_from_bottom: float = (
+                        (p_now - p_min_3y) / p_min_3y * 100 if p_min_3y > 0 else 0.0
+                    )
 
-        if not lows:
-            return stock_info
+                    stock_info.min_price_3y = round(p_min_3y, 2)
+                    stock_info.price_percentile = round(price_percentile, 1)
+                    stock_info.rise_from_bottom = round(rise_from_bottom, 1)
 
-        p_now: float = stock_info.price
-        p_min_3y: float = min(lows)
-        p_max_3y: float = max(highs)
+                    logger.info(
+                        "[K线] %s: 共 %d 条 | 最低=%.2f | 分位=%.1f%% | 反弹=%.1f%%",
+                        code, len(klines), p_min_3y, price_percentile, rise_from_bottom,
+                    )
 
-        # 百分位：当前价在近 3 年高低区间的位置
-        price_percentile: float = (
-            (p_now - p_min_3y) / (p_max_3y - p_min_3y) * 100
-            if p_max_3y != p_min_3y
-            else 0.0
-        )
-
-        # 底部反弹幅度
-        rise_from_bottom: float = (
-            (p_now - p_min_3y) / p_min_3y * 100 if p_min_3y > 0 else 0.0
-        )
-
-        # 回填历史分位字段
-        stock_info.min_price_3y = round(p_min_3y, 2)
-        stock_info.price_percentile = round(price_percentile, 1)
-        stock_info.rise_from_bottom = round(rise_from_bottom, 1)
-
-        logger.info(
-            "[K线] %s: 共 %d 条 | 最低=%.2f | 分位=%.1f%% | 反弹=%.1f%%",
-            code, len(klines), p_min_3y, price_percentile, rise_from_bottom,
-        )
-
-        # ── 风控红线：死亡换手检测（近 5 日最大换手率）──
-        if len(turnovers) >= 5:
-            max_turnover_5d: float = max(turnovers[-5:])
-            death_threshold: float = RISK_THRESHOLDS["DEATH_TURNOVER_PCT"]
-
-            # 排除新股（沪深新股名称以大写 N/C 开头）和 ST 股，换手率规律特殊
-            name_upper: str = stock_info.name.upper()
-            is_new_or_st: bool = (
-                name_upper.startswith("N")
-                or name_upper.startswith("C")
-                or "ST" in stock_info.name
-            )
-
-            if max_turnover_5d > death_threshold and not is_new_or_st:
-                stock_info.holder_trend = (
-                    f"⚠️ 死亡换手警报！近5日极大换手率 {max_turnover_5d:.1f}% "
-                    f"(红线: {death_threshold:.0f}%)，建议立即清仓规避。"
-                )
-                logger.warning(
-                    "[风控] %s 触发死亡换手红线: %.1f%%", code, max_turnover_5d,
-                )
+                    # ── 风控红线：死亡换手检测（近 5 日最大换手率）──
+                    if len(turnovers) >= 5:
+                        max_turnover_5d: float = max(turnovers[-5:])
+                        death_threshold: float = RISK_THRESHOLDS["DEATH_TURNOVER_PCT"]
+                        name_upper: str = stock_info.name.upper()
+                        is_new_or_st: bool = (
+                            name_upper.startswith("N")
+                            or name_upper.startswith("C")
+                            or "ST" in stock_info.name
+                        )
+                        if max_turnover_5d > death_threshold and not is_new_or_st:
+                            stock_info.holder_trend = (
+                                f"⚠️ 死亡换手警报！近5日极大换手率 {max_turnover_5d:.1f}% "
+                                f"(红线: {death_threshold:.0f}%)，建议立即清仓规避。"
+                            )
+                            logger.warning(
+                                "[风控] %s 触发死亡换手红线: %.1f%%", code, max_turnover_5d,
+                            )
+            else:
+                logger.warning("[K线] %s: 东财返回无 K 线数据，尝试 TDX 兜底...", code)
+        else:
+            logger.warning("[K线] %s: safe_request 返回 None，尝试 TDX 兜底...", code)
 
     except Exception as exc:
-        logger.error("[K线] %s 历史分位计算失败: %s", code, exc)
+        logger.error("[K线] %s 东财 HTTP 历史分位计算失败: %s", code, exc)
+
+    # ── V8.4 PyTDX K线兆底：如果东财 HTTP 失败且分位未计算，尝试 TCP 直连 ──
+    if stock_info.min_price_3y == 0.0:
+        try:
+            tdx_bars = get_tdx_kline_bars(code, count=800)
+            if tdx_bars:
+                tdx_lows = [bar["low"] for bar in tdx_bars if bar["low"] > 0]
+                tdx_highs = [bar["high"] for bar in tdx_bars if bar["high"] > 0]
+                tdx_turnovers_raw = []  # TDX K线不含换手率
+                
+                if tdx_lows:
+                    p_now = stock_info.price
+                    p_min_3y = min(tdx_lows)
+                    p_max_3y = max(tdx_highs)
+
+                    price_percentile = (
+                        (p_now - p_min_3y) / (p_max_3y - p_min_3y) * 100
+                        if p_max_3y != p_min_3y else 0.0
+                    )
+                    rise_from_bottom = (
+                        (p_now - p_min_3y) / p_min_3y * 100 if p_min_3y > 0 else 0.0
+                    )
+
+                    stock_info.min_price_3y = round(p_min_3y, 2)
+                    stock_info.price_percentile = round(price_percentile, 1)
+                    stock_info.rise_from_bottom = round(rise_from_bottom, 1)
+
+                    logger.info(
+                        "[K线] [★ PyTDX兆底] %s: %d 条日线 | 最低=%.2f | 分位=%.1f%% | 反弹=%.1f%%",
+                        code, len(tdx_bars), p_min_3y, price_percentile, rise_from_bottom,
+                    )
+        except Exception as exc:
+            logger.warning("[K线] [PyTDX兆底] %s 也失败: %s", code, exc)
 
     return stock_info
 

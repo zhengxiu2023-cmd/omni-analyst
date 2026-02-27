@@ -10,7 +10,7 @@ from main import _audit_single_stock
 import config
 
 if __name__ == "__main__":
-    print("Testing pipeline for 601318...")
-    _audit_single_stock("601318", 1.5)
+    print("Testing pipeline for 600150...")
+    _audit_single_stock("600150", 1.5)
     print("Test finished.")
 

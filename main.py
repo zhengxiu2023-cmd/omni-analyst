@@ -36,6 +36,7 @@ from fetchers.akshare_client import (
     fetch_radar_news,
     fetch_stock_info,
 )
+# V8.4: PyTDX 底层协议引擎已在 akshare_client 内部接入，无需在 main.py 显式调用
 from fetchers.cninfo_spider import download_company_reports
 from fetchers.news_flow_fetcher import execute_radar_scan
 from fetchers.financial_fetcher import fetch_target_and_peers_financials
@@ -363,9 +364,10 @@ def _audit_single_stock(code: str, market_vol: float) -> None:
     print(f"\n  ⚔️ [Step 7/8] 锁定同业标的，开启横向身位与财报对比...")
     competitors_summary = ""
     comp_financials = []
+    industry_reports_text = []
     try:
-        comp_financials = fetch_target_and_peers_financials(target_code=code, save_dir=save_dir)
-        competitors_summary = _format_competitors_to_md(comp_financials)
+        comp_financials, industry_reports_text = fetch_target_and_peers_financials(target_code=code, target_name=stock_info.name, save_dir=save_dir)
+        competitors_summary = _format_competitors_to_md(comp_financials, industry_reports_text)
     except Exception as e:
         logger.error(f"[竞对横评] 提取失败: {e}")
         competitors_summary = "[竞对数据暂时缺失]"
@@ -407,30 +409,48 @@ def _audit_single_stock(code: str, market_vol: float) -> None:
 # ===========================================================================
 # 辅助：竞对财报转 Markdown
 # ===========================================================================
-def _format_competitors_to_md(comp_financials: list[CompetitorFinancials]) -> str:
+def _format_competitors_to_md(comp_financials: list[CompetitorFinancials], industry_reports_text: list[str] = None) -> str:
     """
     将横向比对数据格式化为可读的 Markdown 文本摘要。
+    包含第二级容灾降级的数字对比表格，以及可选的行业大环境研报摘要。
     """
     if not comp_financials:
         return "[竞对数据暂时缺失]"
         
     lines = []
-    def _sa(v, default="[数据未获取]"):
+    def _sa(v, default="[未获取]"):
         return default if v is None or str(v).strip() in ("", "None", "nan", "N/A") else str(v)
         
+    lines.append("| 公司名称 | 代码 | 最新季报期 | 营业收入 | 净利润 |")
+    lines.append("| :--- | :--- | :--- | :--- | :--- |")
+
+    has_real_peers = False
     for res in comp_financials:
-        lines.append(f"**{_sa(res.name)} ({_sa(res.code)})**")
+        if res.code == "000001" and res.name == "THS兜底平替占位":
+            continue
+            
+        if res.code != comp_financials[0].code:
+            has_real_peers = True
+            
         try:
             if res.income_statement_8q and len(res.income_statement_8q) > 0:
                 latest_q = res.income_statement_8q[0]
-                lines.append(f"  - 最新季报期：{_sa(latest_q.get('date'))}")
-                lines.append(f"  - 营业收入：{_sa(latest_q.get('revenue'))}")
-                lines.append(f"  - 净利润：{_sa(latest_q.get('net_profit'))}")
+                lines.append(f"| **{_sa(res.name)}** | `{_sa(res.code)}` | {_sa(latest_q.get('date'))} | {_sa(latest_q.get('revenue'))} | {_sa(latest_q.get('net_profit'))} |")
             else:
-                lines.append("  - 利润表数据: [数据未获取]")
+                lines.append(f"| **{_sa(res.name)}** | `{_sa(res.code)}` | [无数据] | - | - |")
         except Exception as e:
             logger.warning(f"格式化竞对 {res.name} 数据出错: {e}")
-            lines.append("  - [提取异常]")
+            lines.append(f"| **{_sa(res.name)}** | `{_sa(res.code)}` | [提取异常] | - | - |")
+
+    if not has_real_peers and len(comp_financials) > 0:
+        lines.append("")
+        lines.append("*(获取同业竞对代码失败：东财/同花顺API遭封禁，当前仅展示目标股数据)*")
+
+    if industry_reports_text:
+        lines.append("")
+        lines.append("#### 🏛️ [容灾降级] 宏观行业研报摘要")
+        for text in industry_reports_text:
+            lines.append(f"- {text}")
             
     return "\n".join(lines)
 

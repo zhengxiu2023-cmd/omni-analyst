@@ -1,5 +1,15 @@
 # Changelog
 
+## [v8.4.0] - 2026-02-27
+- 引入 PyTDX 协议直连券商主站 (TCP)，彻底解决 HTTP 协议被 WAF 封禁导致的行情获取失败问题。
+- 新建 `fetchers/tdx_client.py`，封装实时行情 (`get_tdx_quotes`) 和历史 K 线 (`get_tdx_kline_bars`) 两大核心通道。
+- 重构 `fetchers/akshare_client.py` 容灾链路，PyTDX TCP 直连升级为 Primary 数据源，原 HTTP 源全部降级为 Fallback。
+- K 线历史分位计算新增 PyTDX 兜底：东财 HTTP 失败时自动切换 TCP 直连获取日线数据。
+
+## [v8.3.0] - 2026-02-27
+- 全链路集成超景气流量雷达 (LLM 提纯) 与竞对横评引擎至 main.py 主流程。
+- 重构参数面板模板严格对齐《超景气框架》数据注入契约。
+
 ## [v8.2.0] - 2026-02-27
 - 修复网络故障，结合本地神经引擎重构超景气流量雷达，引入竞对研报抽吸模块。
 

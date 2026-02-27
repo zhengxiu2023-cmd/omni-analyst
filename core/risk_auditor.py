@@ -157,16 +157,17 @@ def generate_panel_markdown(
     p_min_3y = stock_info.min_price_3y
     
     # Defaults
-    eps_placeholder = "[用户填写]"
+    eps_placeholder = "[API获取失败/暂缺]"
     product_placeholder = "[用户填写，如：主营产品价格近一月暴涨20% / 价格持续阴跌 / 产销持平]"
-    holder_placeholder = "[用户填写，如 增加20% 或 减少10%]"
+    holder_placeholder = "[API获取失败/暂缺]"
     
     # catalyst
     clean_radar = radar_summary.strip('\n ') if radar_summary else ""
     catalyst_val = f"\n{clean_radar}" if clean_radar else "[用户可选填]"
 
     # If holder config is empty, fallback to placeholder
-    holder_val = holder_placeholder if "缺失" in stock_info.holder_trend else stock_info.holder_trend
+    eps_val = stock_info.eps_forecast if stock_info.eps_forecast not in ["提取失败", ""] else eps_placeholder
+    holder_val = stock_info.holder_trend if "缺失" not in stock_info.holder_trend else holder_placeholder
 
     fields = [
         (
@@ -213,7 +214,7 @@ def generate_panel_markdown(
         ),
         (
             "未来三年预期每股收益 (EPS_Y1, EPS_Y2, EPS_Y3)",
-            eps_placeholder,
+            eps_val,
             eps_placeholder,
             False,
             " *(用于精准推演远期动态PE与戴维斯双击)*"
