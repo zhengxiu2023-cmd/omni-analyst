@@ -9,11 +9,15 @@
 """
 
 import logging
+import os
 import pandas as pd
 import akshare as ak
-from typing import List
+from typing import List, Tuple
+
+from config import EXPORT_CONFIG
 
 from core.models import CompetitorFinancials
+from fetchers.cninfo_spider import download_company_reports, download_industry_reports
 
 logger = logging.getLogger(__name__)
 
@@ -26,26 +30,26 @@ def _safe_float_str(val, default="N/A") -> str:
     except (ValueError, TypeError):
         return default
 
-def _get_target_industry_peers(stock_code: str, top_n: int = 2) -> List[dict]:
+def _get_target_industry_peers(stock_code: str, top_n: int = 2) -> Tuple[List[dict], str]:
     """
-    寻找同板块市值最近的竞对标的。
+    寻找同板块市值最近的竞对标的，并返回板块名称。
     """
     try:
         # 获取标的基本信息以确定板块
         info_df = ak.stock_individual_info_em(symbol=stock_code)
         if info_df.empty:
-            return []
+            return [], ""
             
         industry_row = info_df[info_df["item"] == "行业"]
         if industry_row.empty:
-            return []
+            return [], ""
             
         industry_name = str(industry_row["value"].values[0])
         
         # 获取板块内所有成分股
         cons_df = ak.stock_board_industry_cons_em(symbol=industry_name)
         if cons_df.empty:
-            return []
+            return [], industry_name
             
         # 寻找目标公司的市值 (假设使用总市值进行找平)
         target_row = cons_df[cons_df["代码"] == stock_code]
@@ -71,11 +75,11 @@ def _get_target_industry_peers(stock_code: str, top_n: int = 2) -> List[dict]:
             })
             
         logger.info("[竞对发现] %s 属于板块 '%s', 找到贴身竞对: %s", stock_code, industry_name, [p["name"] for p in peers])
-        return peers
+        return peers, industry_name
         
     except Exception as exc:
         logger.warning("[竞对发现] 寻找 %s 的竞对失败: %s", stock_code, exc)
-        return []
+        return [], ""
 
 def _fetch_single_8q(stock_code: str) -> dict:
     """提取单只股票最近 8 期的核心利润/资产/现金流切片。"""
@@ -150,9 +154,9 @@ def _fetch_single_8q(stock_code: str) -> dict:
         
     return result
 
-def fetch_target_and_peers_financials(target_code: str) -> List[CompetitorFinancials]:
+def fetch_target_and_peers_financials(target_code: str, save_dir: str = None) -> List[CompetitorFinancials]:
     """
-    拉取目标公司及其 1-2 位板块竞对的最近 8 期主要财务表指标。防爆捕获，失败不可阻断主流程。
+    拉取目标公司及其 1-2 位板块竞对的最近 8 期主要财务表指标，并联动下载目标、竞对及行业板块高价值深度研报。防爆捕获，失败不可阻断主流程。
     """
     final_results: List[CompetitorFinancials] = []
     
@@ -176,19 +180,35 @@ def fetch_target_and_peers_financials(target_code: str) -> List[CompetitorFinanc
         cash_flow_8q=target_data.get("cash_flow_8q", [])
     ))
     
+    # 下载目标自身的研报 PDF
+    if save_dir:
+        download_company_reports(target_code, target_name, save_dir, is_rival=False)
+        
     # 2. 挖掘竞对并提取 8 期
-    peers = _get_target_industry_peers(target_code, top_n=2)
+    peers, industry_name = _get_target_industry_peers(target_code, top_n=2)
     for peer in peers:
         peer_code = peer["code"]
         peer_name = peer["name"]
         
-        peer_data = _fetch_single_8q(peer_code)
-        final_results.append(CompetitorFinancials(
-            code=peer_code,
-            name=peer_name,
-            income_statement_8q=peer_data.get("income_statement_8q", []),
-            balance_sheet_8q=peer_data.get("balance_sheet_8q", []),
-            cash_flow_8q=peer_data.get("cash_flow_8q", [])
-        ))
+        try:
+            peer_data = _fetch_single_8q(peer_code)
+            final_results.append(CompetitorFinancials(
+                code=peer_code,
+                name=peer_name,
+                income_statement_8q=peer_data.get("income_statement_8q", []),
+                balance_sheet_8q=peer_data.get("balance_sheet_8q", []),
+                cash_flow_8q=peer_data.get("cash_flow_8q", [])
+            ))
+            
+            # 下载竞对的研报 PDF
+            if save_dir:
+                download_company_reports(peer_code, peer_name, save_dir, is_rival=True)
+        except Exception as exc:
+            logger.warning("[竞对抓取] 提取竞对 %s(%s) 失败，已沙盒隔离防崩溃: %s", peer_name, peer_code, exc)
+            continue
+            
+    # 下载行业板块研报 PDF （被削弱为不下载宽泛行业，已在 cninfo 侧处理为空跑）
+    if save_dir and industry_name:
+        download_industry_reports(industry_name, save_dir, limit=3)
         
     return final_results

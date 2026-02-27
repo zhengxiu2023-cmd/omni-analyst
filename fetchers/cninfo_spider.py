@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import time
+import random
 from pathlib import Path
 
 from config import (
@@ -83,22 +84,28 @@ def download_company_reports(
     )
 
     if is_rival:
-        # 竞对股：仅年报 + 最新季报
+        # 竞对股：仅聚焦年度报告和投资者关系纪录
         _download_category(code, name, CNINFO_CATEGORIES["ANNUAL_REPORT"], 1, save_dir)
-        _download_category(code, name, CNINFO_CATEGORIES["Q3_REPORT"], 1, save_dir)
+        _download_category(code, name, category="", limit=3, save_dir=save_dir, searchkey="调研", use_investor_filter=True)
     else:
-        # 目标股：全量底稿
+        # 目标股：仅聚焦年度报告和投资者关系纪录
         _download_category(code, name, CNINFO_CATEGORIES["ANNUAL_REPORT"], 2, save_dir)
-        _download_category(code, name, CNINFO_CATEGORIES["SEMI_ANNUAL"], 2, save_dir)
-        _download_category(code, name, CNINFO_CATEGORIES["Q3_REPORT"], 2, save_dir)
-        _download_category(code, name, CNINFO_CATEGORIES["Q1_REPORT"], 1, save_dir)
-        # 投资者调研纪要：searchkey 全文搜索 + 关键词精准后过滤
         _download_category(
             code, name, category="", limit=5, save_dir=save_dir,
             searchkey="调研", use_investor_filter=True,
         )
 
     logger.info("[巨潮] %s(%s) 全部下载任务完成。", name, code)
+
+
+def download_industry_reports(industry_name: str, save_dir: str, limit: int = 3) -> None:
+    """
+    巨潮 API 对泛行业宽泛搜索敏感，已被要求降维。
+    此方法被弃用，直接跳过。
+    """
+    logger.info("[巨潮] 放弃宽泛的行业宏观研报搜索: %s", industry_name)
+    pass
+
 
 
 # 巨潮搜索接口（替代已下线的静态全量 JSON）
@@ -179,31 +186,41 @@ def _download_category(
         searchkey:           全文搜索关键词（如 "调研"），传空字符串表示不使用关键词搜索。
         use_investor_filter: 是否启用 INVESTOR_DOC_KEYWORDS 精准后过滤（针对调研纪要）。
     """
-    org_id: str = _get_org_id(code)
-    # orgId 为空时巨潮接口会返回随机公司公告——必须拒绝！
-    if not org_id:
-        logger.warning(
-            "[巨潮] %s(%s) orgId 获取失败，跳过该类别下载（防止下载错误公司公告）。",
-            name, code,
-        )
-        return
-    stock_param: str = f"{code},{org_id}"
-
-    # 根据代码自动适配交易所列（szse=深交所，sse=上交所）
-    column: str = "sse" if str(code).startswith("6") else "szse"
+    stock_param = ""
+    column = "szse" # 默认深交所（包含泛市场搜索）
+    
+    if code:
+        org_id: str = _get_org_id(code)
+        # orgId 为空时巨潮接口会返回随机公司公告——必须拒绝！
+        if not org_id:
+            logger.warning(
+                "[巨潮] %s(%s) orgId 获取失败，跳过该类别下载（防止下载错误公司公告）。",
+                name, code,
+            )
+            return
+        stock_param = f"{code},{org_id}"
+        # 根据代码自动适配交易所列
+        column = "sse" if str(code).startswith(("6", "9", "5")) else "szse"
 
     payload: dict = {
         "pageNum": 1,
-        "pageSize": 20,
+        "pageSize": 30,
         "column": column,
         "tabName": "fulltext",
-        "stock": stock_param,
         "isHLtitle": "true",
     }
+    
+    if stock_param:
+        payload["stock"] = stock_param
     if category:
         payload["category"] = category
     if searchkey:
         payload["searchkey"] = searchkey
+
+    # ── 强制防爬随机抖动 ──
+    jitter = random.uniform(2.0, 4.0)
+    logger.debug("[巨潮] 发起请求前强制休眠防封: %.2f 秒", jitter)
+    time.sleep(jitter)
 
     try:
         resp = safe_request(API_CONFIG["CNINFO_URL"], method="post", data=payload)
@@ -234,9 +251,9 @@ def _download_category(
         if not adjunct_url:
             continue
 
-        # 二次校验：确保公告的 secCode 属于目标股（防止接口返回不相关公告）
+        # 二次校验：确保公告的 secCode 属于目标股（当通过 code 搜索时）
         ann_code: str = str(ann.get("secCode", ""))
-        if ann_code and ann_code != code:
+        if code and ann_code and ann_code != code:
             logger.debug("[巨潮] 跳过非目标股公告: secCode=%s != %s | %s", ann_code, code, raw_title[:40])
             continue
 

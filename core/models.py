@@ -94,3 +94,18 @@ class RiskStatus:
     death_turnover_warn: str = "[安全]"  # 死亡换手率警告文案（触发则写入具体数值）
     extreme_rise_warn: str = ""         # 近 60 日极端透支警告文案（未触发则为空字符串）
     st_warning: str = "[通过]"           # 财务暴雷/ST 警告文案（触发则写入红色警报文案）
+
+
+# ===========================================================================
+# 1.4 HyperProsperityEvent — 超景气现象级事件模型
+# 由 fetchers/news_flow_fetcher.py 结合本地 LLM 从双轨热榜中提纯生成
+# ===========================================================================
+@dataclass
+class HyperProsperityEvent:
+    """被神经引擎识别为具有超景气共振潜力的现象级事件摘要"""
+    title: str                           # 核心事件标题/摘要
+    category: str                        # 框架映射：[科技突变] / [政经大局] / [供需极值]
+    resonance: str                       # 共振验证结果：[真·现象级破圈] / [逻辑孕育期] 等
+    k_value: float                       # 流量病毒系数 K 值
+    key_signals: list[str] = field(default_factory=list) # 提取的关键信息素数组
+

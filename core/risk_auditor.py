@@ -136,180 +136,184 @@ def evaluate_risk(stock_info: StockInfo, market_vol: float) -> RiskStatus:
 def generate_panel_markdown(
     stock_info: StockInfo,
     risk_status: RiskStatus,
-    catalyst_str: str,
+    radar_summary: str,
+    competitors_summary: str,
     pdf_rag_info: list[str],
     save_dir: str,
 ) -> None:
     """
     生成或智能合并"00_参数面板_发给AI.md"。
-
-    智能合并规则（提取自 souji0_1.py _generate_parameters 的合并逻辑）：
-      - 字段分为"高信心"和"低信心"两类。
-      - 高信心字段（价格、PE、换手率等）：始终用程序抓取的新值覆盖。
-      - 低信心字段（EPS预测、产品趋势等）：
-          * 若旧面板中该字段与默认占位符相同（用户未改动）→ 用新值覆盖。
-          * 若旧面板中该字段已被用户手动修改 → 保留用户修改，不覆盖！
-
-    EPS 反算逻辑：通过 P / PE_TTM 反算 EPS_TTM（参考旧代码）。
-
-    Args:
-        stock_info:   完整的行情与历史分位数据。
-        risk_status:  熔断判定结果。
-        catalyst_str: 催化剂/行业背景描述字符串（由 main.py 拼接后传入）。
-        pdf_rag_info: pdf_extractor 提取的增量关键句列表（可为空）。
-        save_dir:     目标股文件夹路径（面板文件写入此处）。
+    完全遵守 V8.3 契约。
     """
     panel_path: str = os.path.join(save_dir, EXPORT_CONFIG["PANEL_FILENAME"])
+    
+    def _sa(v, default="[数据未获取]"):
+        return default if v is None or str(v).strip() in ("", "None", "nan", "N/A") else str(v)
 
-    # ── EPS 反算（PE_TTM × 当前价格的逆运算）──
-    eps_forecast: str = "提取失败，需结合券商研报自行研判"
-    try:
-        if stock_info.pe_ttm != "N/A" and stock_info.price > 0:
-            pe_val = float(stock_info.pe_ttm)  # type: ignore[arg-type]
-            if pe_val > 0:
-                eps_ttm = round(stock_info.price / pe_val, 2)
-                eps_forecast = (
-                    f"EPS_TTM ≈ {eps_ttm} 元/股（由 P÷PE_TTM 反算，"
-                    "未来年度预测需参考最新券商研报）"
-                )
-    except (ValueError, TypeError):
-        pass
+    # ── 构建字段集合，分为高信心与低信心 ──
+    # format: (key_name, computed_value, default_placeholder, is_high_confidence, suffix)
+    
+    p_now = stock_info.price
+    p_min_3y = stock_info.min_price_3y
+    
+    # Defaults
+    eps_placeholder = "[用户填写]"
+    product_placeholder = "[用户填写，如：主营产品价格近一月暴涨20% / 价格持续阴跌 / 产销持平]"
+    holder_placeholder = "[用户填写，如 增加20% 或 减少10%]"
+    
+    # catalyst
+    clean_radar = radar_summary.strip('\n ') if radar_summary else ""
+    catalyst_val = f"\n{clean_radar}" if clean_radar else "[用户可选填]"
 
-    # ── 构建字段列表（key, value, confidence）──
-    # confidence = "high" → 程序可靠获取，直接覆盖
-    # confidence = "low"  → 依赖用户补充，保留用户手改
-    p_now: float = stock_info.price
-    fields: list[tuple[str, str, str]] = [
+    # If holder config is empty, fallback to placeholder
+    holder_val = holder_placeholder if "缺失" in stock_info.holder_trend else stock_info.holder_trend
+
+    fields = [
         (
             "标的名称/代码",
-            f"{stock_info.name} ({stock_info.code}) | 风控: {risk_status.st_warning}",
-            "high",
+            f"{stock_info.name} ({stock_info.code})",
+            "",
+            True,
+            ""
         ),
         (
             "当前价格 (P_now)",
-            f"{p_now:.2f} 元",
-            "high" if p_now > 0 else "low",
+            f"{p_now:.2f}",
+            "",
+            p_now > 0,
+            ""
         ),
         (
             "近3年最低价 (P_min_3y, 前复权)",
-            (
-                f"{stock_info.min_price_3y:.2f} 元 "
-                f"(自底部已反弹 {stock_info.rise_from_bottom:.1f}%)"
-                f"{risk_status.extreme_rise_warn}"
-            ) if stock_info.min_price_3y > 0 else "[K线接口异常，历史数据待下次刷新]",
-            "high" if stock_info.min_price_3y > 0 else "low",
+            f"{p_min_3y:.2f}",
+            "",
+            p_min_3y > 0,
+            ""
         ),
         (
             "当前价格历史分位 (Price_Percentile)",
-            f"{stock_info.price_percentile:.1f}%" if stock_info.min_price_3y > 0
-            else "[K线接口异常，分位数据待下次刷新]",
-            "high" if stock_info.min_price_3y > 0 else "low",
+            f"{stock_info.price_percentile:.1f}",
+            "",
+            p_min_3y > 0,
+            "% *(用于识别长期箱体底部的深跌错杀)*"
         ),
         (
-            "最新滚动市盈率 (PE_TTM)",
+            "最新静态/动态市盈率 (PE_TTM)",
             str(stock_info.pe_ttm),
-            "high" if stock_info.pe_ttm != "N/A" else "low",
+            "",
+            stock_info.pe_ttm != "N/A",
+            ""
         ),
         (
             "最新市净率 (PB)",
             str(stock_info.pb),
-            "high" if stock_info.pb != "N/A" else "low",
+            "",
+            stock_info.pb != "N/A",
+            " *(针对周期反转/核心资产必填)*"
         ),
         (
-            "总市值",
-            f"{stock_info.total_mv / 1e8:.2f} 亿元" if stock_info.total_mv > 0 else "N/A",
-            "high" if stock_info.total_mv > 0 else "low",
+            "未来三年预期每股收益 (EPS_Y1, EPS_Y2, EPS_Y3)",
+            eps_placeholder,
+            eps_placeholder,
+            False,
+            " *(用于精准推演远期动态PE与戴维斯双击)*"
         ),
         (
-            "未来三年预期每股收益 (EPS_Y1/Y2/Y3)",
-            eps_forecast,
-            "low",   # 反算值精度低，保留用户手改
-        ),
-        (
-            "核心产品现货/期货价格趋势或订单销量",
-            "[请结合源头情报或 PDF 纪要人工填入：例如产品正在涨价，或产能满载]",
-            "low",
+            "核心产品现货/期货价格趋势 或 订单销量",
+            product_placeholder,
+            product_placeholder,
+            False,
+            " *(决定景气度是否能拿满分的生死指标)*"
         ),
         (
             "今日换手率 (Turnover)",
-            f"{stock_info.turnover:.2f}% | {risk_status.death_turnover_warn}",
-            "high" if stock_info.turnover > 0 else "low",
+            f"{stock_info.turnover:.2f}",
+            "",
+            stock_info.turnover > 0,
+            "%"
         ),
         (
-            "两市今日总成交额 (Market_Vol / F乘数)",
-            risk_status.market_vol_desc,
-            "high",
+            "两市今日总成交额 (Market_Vol)",
+            risk_status.market_vol_desc.split(" ")[0] if risk_status.market_vol_desc else "N/A",
+            "",
+            True,
+            " 万亿" # Added text outside
         ),
         (
-            "最新股东户数变化趋势",
-            stock_info.holder_trend,
-            "high" if "缺失" not in stock_info.holder_trend else "low",
+            "最新股东户数变化",
+            holder_val,
+            holder_placeholder,
+            False,
+            " *(主力吸筹/派发的照妖镜)*"
         ),
         (
-            "核心催化剂与行业背景",
-            catalyst_str,
-            "high",
-        ),
+            "核心催化剂/行业背景",
+            catalyst_val,
+            "[用户可选填]",
+            radar_summary != "",
+            ""
+        )
     ]
-
+    
     # ── 读取旧面板（如存在），解析为 {字段名: 旧值} 字典 ──
     old_fields: dict[str, str] = {}
-    old_rag_block: str = ""          # 保留旧面板中已有的 RAG 增量内容
+    old_rag_block: str = ""
 
     if os.path.exists(panel_path):
         old_fields, old_rag_block = _parse_existing_panel(panel_path)
         logger.info("[面板] 发现旧面板，启动智能合并模式。")
 
-    # ── 智能合并：逐字段判断是否保留用户手改 ──
     merged_lines: list[str] = [
-        f"# 📊 超景气价值投机 · 风控参数面板",
-        f"> **标的**: {stock_info.name}({stock_info.code})  "
-        f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M')}  "
-        f"**引擎**: Omni-Analyst v7.5",
-        "",
-        "---",
-        "",
+        "## 📋 [必填] 标的参数面板 (Data Injection Panel)",
+        "*(用户需提供以下“硬数据”，若留空，AI 将基于最新公开数据进行推演并标注估算风险)*",
+        ""
     ]
 
-    for key, new_val, confidence in fields:
-        if confidence == "low" and key in old_fields:
-            old_val: str = old_fields[key]
-            # 旧值与新默认值不同 & 旧值非模板占位符 → 用户手改，保留
-            placeholder_identifiers = ["[请结合", "提取失败", "反算", "N/A"]
-            is_placeholder = any(p in old_val for p in placeholder_identifiers)
-            if old_val and old_val != new_val and not is_placeholder:
-                merged_lines.append(f"**{key}：** {old_val}  *(↑ 已保留您的手工修改)*")
-                continue
+    for key, new_val, placeholder, is_high_conf, suffix in fields:
+        final_val = new_val
+        
+        # Merge logic for low confidence
+        if not is_high_conf and key in old_fields:
+            old_val = old_fields[key]
+            # If user modified the field (not placeholder anymore)
+            if old_val and placeholder and placeholder not in old_val:
+                final_val = old_val
 
-        merged_lines.append(f"**{key}：** {new_val}")
+        # Add to lines
+        # Special logic to prevent double suffix if old_val actually contains the suffix already, 
+        # but safely we just put suffix. Old parsing strips suffix if possible.
+        merged_lines.append(f"* **{key}：** {final_val}{suffix}")
 
-    # ── 追加增量 RAG 提纯数据 ──
+    # ── 追加补充区域 ──
+    merged_lines.append("")
+    merged_lines.append("---")
+    merged_lines.append("### 📎 [系统自动附加] 深度审计底料 (Supplemental Data)")
+    
+    roe_val = _sa(stock_info.roe)
+    gm_val = _sa(stock_info.gross_margin)
+    merged_lines.append(f"**1. 核心盈利能力:** ROE={roe_val} | 毛利率={gm_val}")
+    
+    merged_lines.append("**2. 横向竞争格局:**")
+    comp_text = competitors_summary if competitors_summary else "[竞对数据暂时缺失]"
+    merged_lines.append(comp_text)
+    merged_lines.append("")
+    
+    merged_lines.append("**3. 增量硬核信号 (RAG Extracted):**")
     if pdf_rag_info:
-        merged_lines.append("")
-        merged_lines.append("---")
-        merged_lines.append(
-            f"### 📄 PDF 增量 RAG 提纯数据 ({datetime.now().strftime('%Y-%m-%d')}):"
-        )
         for sentence in pdf_rag_info:
             merged_lines.append(f"- {sentence}")
-
-    # 追加旧面板中已有的 RAG 块（历史版本不丢失）
-    if old_rag_block:
-        merged_lines.append("")
+    elif old_rag_block:
         merged_lines.append(old_rag_block.strip())
-
-    # ── 写文件 ──
+    else:
+        merged_lines.append("无增量信号")
+        
     final_content: str = "\n".join(merged_lines) + "\n"
 
     try:
         os.makedirs(save_dir, exist_ok=True)
         with open(panel_path, "w", encoding="utf-8") as f:
             f.write(final_content)
-        logger.info(
-            "[面板] ✅ 参数面板已写入: %s (%d 行)",
-            panel_path,
-            len(merged_lines),
-        )
+        logger.info("[面板] ✅ 参数面板已写入: %s", panel_path)
     except Exception as exc:
         logger.error("[面板] 写入失败: %s", exc)
 
@@ -328,23 +332,26 @@ def _parse_existing_panel(panel_path: str) -> tuple[dict[str, str], str]:
     """
     fields: dict[str, str] = {}
     rag_block: str = ""
-    rag_marker: str = "### 📄"
+    rag_marker: str = "**3. 增量硬核信号 (RAG Extracted):**"
 
     try:
         with open(panel_path, "r", encoding="utf-8") as f:
             content: str = f.read()
 
-        # 提取旧 RAG 块（"### 📄" 标记之后的所有内容）
+        # 提取旧 RAG 块
         rag_idx: int = content.find(rag_marker)
         if rag_idx != -1:
-            rag_block = content[rag_idx:]
+            rag_block = content[rag_idx + len(rag_marker):].strip()
 
-        # 解析字段：格式为 "**字段名：** 字段值"
+        # 解析字段：格式为 "* **字段名：** 字段值"
         for line in content.split("\n"):
             line = line.strip()
+            if line.startswith("* "):
+                line = line[2:].strip()
+                
             if line.startswith("**") and "：** " in line:
-                # 去掉末尾的手改标注（如 "*(↑ 已保留您的手工修改)*"）
-                line_clean = line.split("*(↑")[0].strip()
+                # 去掉末尾的固定后缀提示（如 "*(用于..."）
+                line_clean = line.split("*(")[0].strip()
                 parts = line_clean.split("：** ", 1)
                 if len(parts) == 2:
                     key: str = parts[0].replace("**", "").strip()

@@ -8,7 +8,7 @@ omni_analyst/
 ├── main.py                    # 🟢 终端主入口 (UI交互层)
 ├── config.py                  # ⚙️ 全局配置中心 (正则词库/API地址/Headers/模型参数)
 ├── core/                      # 🔴 核心业务与引擎层
-│   ├── models.py              # 🧱 核心数据结构 (Dataclasses: StockInfo新增pe_ttm/roe/gross_margin, CompetitorFinancials)
+│   ├── models.py              # 🧱 核心数据结构 (Dataclasses: StockInfo新增pe_ttm/roe/gross_margin, CompetitorFinancials, HyperProsperityEvent)
 │   ├── network_engine.py      # 军工级请求重试(Tenacity指数退避/UA轮换/随机抖动)与流式下载
 │   ├── llm_engine.py          # Ollama 本地模型交互封装
 │   ├── db_client.py           # (可选) MongoDB 持久化客户端

@@ -36,8 +36,10 @@ from fetchers.akshare_client import (
     fetch_radar_news,
     fetch_stock_info,
 )
-from fetchers.cctv_news import fetch_cctv_news
 from fetchers.cninfo_spider import download_company_reports
+from fetchers.news_flow_fetcher import execute_radar_scan
+from fetchers.financial_fetcher import fetch_target_and_peers_financials
+from core.models import CompetitorFinancials
 from utils.pdf_extractor import extract_rag_info_from_pdf
 
 # ── 模块级状态：LLM 是否可用（启动时检测一次，全局共享）──
@@ -347,45 +349,43 @@ def _audit_single_stock(code: str, market_vol: float) -> None:
         config.EXPORT_CONFIG["OUTPUT_DIR"],
         f"{stock_info.name}_{code}",
     )
-    os.makedirs(save_dir, exist_ok=True)
-    print(f"  ✅  目录: [{save_dir}]")
+    
+    # ── 动作 B: 强制接入“超景气社交流量雷达 (LLM 提纯)” ──
+    print(f"\n  📡 [Step 6/8] 启动超景气流量雷达与本地神经引擎定性...")
+    radar_summary = ""
+    try:
+        radar_summary = execute_radar_scan(code, stock_info.name)
+    except Exception as e:
+        logger.error(f"[流量雷达] 提取失败: {e}")
+        radar_summary = "[流量雷达数据暂时缺失，请用户结合市场盘面自行判定]"
+        
+    # ── 动作 C: 强制接入“竞对提取与横向比对” ──
+    print(f"\n  ⚔️ [Step 7/8] 锁定同业标的，开启横向身位与财报对比...")
+    competitors_summary = ""
+    comp_financials = []
+    try:
+        comp_financials = fetch_target_and_peers_financials(target_code=code, save_dir=save_dir)
+        competitors_summary = _format_competitors_to_md(comp_financials)
+    except Exception as e:
+        logger.error(f"[竞对横评] 提取失败: {e}")
+        competitors_summary = "[竞对数据暂时缺失]"
 
-    # ── Step 6: 下载巨潮 PDF 底稿 ──
-    print(f"\n  📥 [Step 6/8] 启动流式引擎抽吸巨潮 PDF 底稿...")
-    print("  ● 目标股：年报×2 / 半年报×2 / 三季报×2 / 一季报×1 / 调研纪要×5")
-    download_company_reports(
-        code=code,
-        name=stock_info.name,
-        save_dir=save_dir,
-        is_rival=False,
-    )
-    # 【可选】获取竞对股并下载其年报（独立 try 保护，竞对失败不影响目标股）
-    rival_code: str = _find_rival_code(code, stock_info.name)
-    if rival_code:
-        print(f"  ● 竞对股 [{rival_code}]：年报×1 / 三季报×1")
-        download_company_reports(
-            code=rival_code,
-            name=rival_code,
-            save_dir=save_dir,
-            is_rival=True,
-        )
-
-    # ── Step 7: PDF RAG 提取（仅对年报/调研类）──
-    print(f"\n  🔬 [Step 7/8] 扫描 PDF 目录，提取增量 RAG 硬核信号...")
+    # ── Step 8: PDF RAG 提取（仅对年报/调研类）──
+    print(f"\n  🔬 [Step 8/8] 扫描 PDF 目录，提取增量 RAG 硬核信号...")
     rag_sentences: list[str] = _extract_rag_from_dir(save_dir)
     if rag_sentences:
         print(f"  ✅  共提取 {len(rag_sentences)} 条关键句。")
     else:
         print("  ─  本次无新 PDF 或未命中关键词，RAG 内容为空。")
 
-    # ── Step 8: 生成/合并风控面板 + DB 入库 ──
-    print(f"\n  ⚙️  [Step 8/8] 融合组装参数面板，执行智能合并...")
-    catalyst_str: str = f"主营板块: 【数据待补充】| 请结合 PDF 调研纪要人工填入核心催化剂"
+    # ── 终极面板组装 ──
+    print(f"\n  ⚙️  融合组装参数面板，执行智能合并...")
 
     generate_panel_markdown(
         stock_info=stock_info,
         risk_status=risk_status,
-        catalyst_str=catalyst_str,
+        radar_summary=radar_summary,
+        competitors_summary=competitors_summary,
         pdf_rag_info=rag_sentences,
         save_dir=save_dir,
     )
@@ -401,52 +401,38 @@ def _audit_single_stock(code: str, market_vol: float) -> None:
     print(f"     → {panel_path}")
 
 
-# ===========================================================================
-# 辅助：获取竞对股代码（简化版，容灾保护）
-# ===========================================================================
-def _find_rival_code(target_code: str, target_name: str) -> str:
-    """
-    通过 akshare 获取同行业市值最大的竞对股代码（非目标股本身）。
-
-    Returns:
-        竞对股 6 位代码字符串，失败时返回空字符串。
-    """
-    try:
-        import akshare as ak
-
-        # 获取目标股行业
-        ind_info = ak.stock_individual_info_em(symbol=target_code)
-        industry_rows = ind_info[ind_info["item"] == "行业"]
-        if industry_rows.empty:
-            return ""
-
-        core_industry: str = str(industry_rows["value"].values[0])
-
-        # 匹配板块
-        all_boards = ak.stock_board_industry_name_em()
-        matched_board = next(
-            (b for b in all_boards["板块名称"]
-             if core_industry in b or b in core_industry),
-            None,
-        )
-        if not matched_board:
-            return ""
-
-        # 板块成分股按总市值排序，取第一个非目标股
-        cons_df = ak.stock_board_industry_cons_em(symbol=matched_board)
-        cons_df = cons_df.sort_values(by="总市值", ascending=False)
-
-        for _, row in cons_df.iterrows():
-            rival = str(row.get("代码", ""))
-            if rival and rival != target_code:
-                rival_name: str = str(row.get("名称", rival))
-                print(f"  🎯 寻敌雷达锁定竞对: 【{matched_board}】最强对手 → {rival_name}({rival})")
-                return rival
-
-    except Exception as exc:
-        logger.warning("[竞对] 行业竞对查询失败（不影响目标股流程）: %s", exc)
-
     return ""
+
+
+# ===========================================================================
+# 辅助：竞对财报转 Markdown
+# ===========================================================================
+def _format_competitors_to_md(comp_financials: list[CompetitorFinancials]) -> str:
+    """
+    将横向比对数据格式化为可读的 Markdown 文本摘要。
+    """
+    if not comp_financials:
+        return "[竞对数据暂时缺失]"
+        
+    lines = []
+    def _sa(v, default="[数据未获取]"):
+        return default if v is None or str(v).strip() in ("", "None", "nan", "N/A") else str(v)
+        
+    for res in comp_financials:
+        lines.append(f"**{_sa(res.name)} ({_sa(res.code)})**")
+        try:
+            if res.income_statement_8q and len(res.income_statement_8q) > 0:
+                latest_q = res.income_statement_8q[0]
+                lines.append(f"  - 最新季报期：{_sa(latest_q.get('date'))}")
+                lines.append(f"  - 营业收入：{_sa(latest_q.get('revenue'))}")
+                lines.append(f"  - 净利润：{_sa(latest_q.get('net_profit'))}")
+            else:
+                lines.append("  - 利润表数据: [数据未获取]")
+        except Exception as e:
+            logger.warning(f"格式化竞对 {res.name} 数据出错: {e}")
+            lines.append("  - [提取异常]")
+            
+    return "\n".join(lines)
 
 
 # ===========================================================================

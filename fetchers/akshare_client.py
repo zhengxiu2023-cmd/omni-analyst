@@ -206,9 +206,9 @@ def fetch_stock_info(code: str) -> StockInfo:
     多源容灾获取单只股票行情，封装为 StockInfo 对象。
 
     数据源优先级：
-      1. Primary: 东财 Push2 实时行情接口（价/PE/PB/换手/市值/名称）
-      2. Fallback 1: 腾讯直连接口 qt.gtimg.cn（轻量级，抗封禁极强）
-      3. Fallback 2: akshare 新浪实时行情 (stock_zh_a_spot)
+      1. Primary: 腾讯直连接口 qt.gtimg.cn（轻量级，抗封禁极强）
+      2. Fallback 1: akshare 新浪实时行情 (stock_zh_a_spot)
+      3. Fallback 2: 东财 Push2 实时行情接口（价/PE/PB/换手/市值/名称）
       兜底: akshare 静态名称映射
 
     Args:
@@ -248,7 +248,62 @@ def fetch_stock_info(code: str) -> StockInfo:
             logger.warning("[财务增强] %s 获取 ROE/毛利率失败: %s", code, ex)
 
     # -------------------------------------------------------------------------
-    # 主力源：东财 Push2
+    # 主力源：腾讯行情接口 qt.gtimg.cn（极快且极其稳定）
+    # -------------------------------------------------------------------------
+    try:
+        # 腾讯前缀：sh600000, sz000001
+        tx_prefix = "sh" if code.startswith(("6", "9", "5")) else "sz"
+        tx_symbol = f"{tx_prefix}{code}"
+        tx_url = f"http://qt.gtimg.cn/q={tx_symbol}"
+        
+        resp = safe_request(tx_url, method="get")
+        if resp is not None and resp.text.startswith("v_"):
+            parts = resp.text.split("=")[1].strip('";\n').split("~")
+            
+            def _get_part(idx: int, default: str = "") -> str:
+                return parts[idx] if idx < len(parts) else default
+                
+            if len(parts) > 3: # 至包含名称和价格
+                stock_info_obj = StockInfo(
+                    code=code,
+                    name=_get_part(1, code),
+                    price=_safe_float(_get_part(3)),
+                    turnover=_safe_float(_get_part(38)),
+                    pe_ttm=_safe_numeric(_get_part(39)),
+                    pb=_safe_numeric(_get_part(46)),
+                    total_mv=_safe_float(_get_part(45)) * 100000000, # 腾讯返回单位是亿
+                )
+                logger.info("[行情] [腾讯Primary] %s(%s) 获取成功。", stock_info_obj.name, code)
+                _enrich_financials(stock_info_obj)
+                return stock_info_obj
+    except Exception as exc:
+        logger.warning("[行情] [腾讯Primary] %s 解析失败，准备降级: %s", code, exc)
+
+    # -------------------------------------------------------------------------
+    # 备用源 1：akshare 新浪接口兜底 (仅保证基础名字与价格)
+    # -------------------------------------------------------------------------
+    try:
+        df_sina = ak.stock_zh_a_spot()
+        row_match = df_sina[df_sina["代码"] == secid.replace(".", "").lower()]
+        if not row_match.empty:
+            row = row_match.iloc[0]
+            stock_info_obj = StockInfo(
+                code=code,
+                name=str(row.get("名称", code)),
+                price=_safe_float(row.get("最新价")),
+                turnover=_safe_float(row.get("换手率")),
+                pe_ttm=_safe_numeric(row.get("市盈率-动态")),
+                pb=_safe_numeric(row.get("市净率")),
+                total_mv=_safe_float(row.get("总市值"))
+            )
+            logger.info("[行情] [新浪Fallback] %s(%s) 获取成功。", stock_info_obj.name, code)
+            _enrich_financials(stock_info_obj)
+            return stock_info_obj
+    except Exception as exc:
+        logger.warning("[行情] [新浪Fallback] %s 失败，准备降级: %s", code, exc)
+
+    # -------------------------------------------------------------------------
+    # 备用源 2：东财 Push2 (最容易遭遇 RemoteDisconnected 的源，放到最后防抖)
     # -------------------------------------------------------------------------
     try:
         params = {
@@ -272,58 +327,11 @@ def fetch_stock_info(code: str) -> StockInfo:
                     pb=_safe_numeric(data.get("f167")),
                     total_mv=_safe_float(data.get("f116")),
                 )
-                logger.info("[行情] [东财Primary] %s(%s) 获取成功。", stock_info_obj.name, code)
+                logger.info("[行情] [东财Fallback] %s(%s) 获取成功。", stock_info_obj.name, code)
                 _enrich_financials(stock_info_obj)
                 return stock_info_obj
     except Exception as exc:
-        logger.warning("[行情] [东财Primary] %s 失败，准备降级: %s", code, exc)
-
-    # -------------------------------------------------------------------------
-    # 备用源 1：腾讯行情接口 qt.gtimg.cn（极快且极其稳定）
-    # -------------------------------------------------------------------------
-    try:
-        # 腾讯前缀：sh600000, sz000001
-        tx_prefix = "sh" if code.startswith(("6", "9", "5")) else "sz"
-        tx_symbol = f"{tx_prefix}{code}"
-        tx_url = f"http://qt.gtimg.cn/q={tx_symbol}"
-        
-        resp = safe_request(tx_url, method="get")
-        if resp is not None and resp.text.startswith("v_"):
-            # 格式: v_sh601318="1~中国平安~601318~52.12~..."
-            # 0:未知 1:名字 2:代码 3:当前价格 4:昨天收盘 5:开盘 6:成交量 7:外盘 8:内盘 9:买一...
-            # 37:当前价格 38:换手率 39:市盈率 43:振幅 44:流通市值 45:总市值 46:市净率
-            parts = resp.text.split("=")[1].strip('";\n').split("~")
-            if len(parts) > 46:
-                stock_info_obj = StockInfo(
-                    code=code,
-                    name=parts[1],
-                    price=_safe_float(parts[3]),
-                    turnover=_safe_float(parts[38]),
-                    pe_ttm=_safe_numeric(parts[39]),
-                    pb=_safe_numeric(parts[46]),
-                    total_mv=_safe_float(parts[45]) * 100000000, # 腾讯返回单位是亿
-                )
-                logger.info("[行情] [腾讯Fallback] %s(%s) 获取成功。", stock_info_obj.name, code)
-                _enrich_financials(stock_info_obj)
-                return stock_info_obj
-    except Exception as exc:
-        logger.warning("[行情] [腾讯Fallback] %s 失败，准备降级: %s", code, exc)
-
-    # -------------------------------------------------------------------------
-    # 备用源 2：akshare 新浪接口兜底
-    # -------------------------------------------------------------------------
-    try:
-        df_sina = ak.stock_zh_a_spot()
-        row_match = df_sina[df_sina["代码"] == secid.replace(".", "").lower()]
-        if not row_match.empty:
-            row = row_match.iloc[0]
-            fallback.name = str(row.get("名称", code))
-            fallback.price = _safe_float(row.get("最新价"))
-            logger.info("[行情] [新浪Fallback] %s(%s) 仅补全名称与价格。", fallback.name, code)
-            _enrich_financials(fallback)
-            return fallback
-    except Exception as exc:
-        logger.error("[行情] [新浪Fallback] %s 彻底失败: %s", code, exc)
+        logger.error("[行情] [东财Fallback] %s 彻底失败: %s", code, exc)
 
     # -------------------------------------------------------------------------
     # 最终防御：静态映射 (防断网把名字抹除)
