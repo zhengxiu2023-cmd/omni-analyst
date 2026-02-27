@@ -16,14 +16,18 @@
 """
 
 import logging
+import os
+import re
 from datetime import datetime, timedelta
 from typing import Union
 
 import akshare as ak
 import pandas as pd
+import requests
 
 from config import (
     API_CONFIG,
+    EXPORT_CONFIG,
     CNINFO_CATEGORIES,
     EM_MKT_UT_TOKEN,
     EM_REALTIME_FIELDS,
@@ -250,50 +254,116 @@ def fetch_stock_info(code: str) -> StockInfo:
 
     # 辅助闭包：补充预期 EPS 和 股东户数
     def _enrich_advanced_fundamentals(obj: StockInfo):
-        # 1. EPS 预测提取
+        # 1. EPS 预测提取 (V8.14: 物理落盘落与靶向 EPS 截取)
         try:
-            df_profit = ak.stock_profit_forecast()
-            if df_profit is not None and not df_profit.empty:
-                df_target = df_profit[df_profit["代码"] == code]
-                if not df_target.empty:
-                    current_year = datetime.now().year
-                    eps_strings = []
-                    df_target = df_target.sort_values(by="预测年份")
-                    for _, row in df_target.iterrows():
-                        pred_year = _safe_float(row.get("预测年份", 0))
-                        if pred_year >= current_year:
-                            eps_val = _safe_float(row.get("每股收益", 0))
-                            if eps_val > 0:
-                                eps_strings.append(f"{int(pred_year)}E: {eps_val:.2f}元")
-                            if len(eps_strings) >= 2:
-                                break
-                    if eps_strings:
-                        obj.eps_forecast = ", ".join(eps_strings)
-                    else:
-                        obj.eps_forecast = "无研报覆盖"
+            df_research = ak.stock_research_report_em(symbol=code)
+            if df_research is not None and not df_research.empty:
+                # 提取前3篇研报
+                report_texts = []
+                
+                for _, row in df_research.head(3).iterrows():
+                    r_title = str(row.get("报告名称", "")).strip()
+                    r_summary = str(row.get("投资评级摘要", "")).strip()
+                    r_date = str(row.get("日期", "")).strip()
+                    r_org = str(row.get("机构", "")).strip()
+                    
+                    if r_title:
+                        # 用于物理保存的文件内容
+                        report_texts.append(f"【{r_title}】 (机构: {r_org} | 发布于: {r_date})\n投研摘要: {r_summary}\n" + "-"*40)
+                
+                # V8.14: 保存这 3 篇研报到物理目录
+                if report_texts:
+                    try:
+                        save_dir = os.path.join(EXPORT_CONFIG["OUTPUT_DIR"], f"{obj.name}_{code}")
+                        os.makedirs(save_dir, exist_ok=True)
+                        report_path = os.path.join(save_dir, "最新券商研报_3篇.txt")
+                        with open(report_path, "w", encoding="utf-8") as f:
+                            f.write("\n\n".join(report_texts))
+                        logger.info("[研报] 已将 3 篇最新券商研报物理保存至: %s", report_path)
+                    except Exception as io_exc:
+                        logger.warning("[研报] 物理保存券商研报失败: %s", io_exc)
+                
+                # 靶向寻找包含 'EPS' 对齐的结构化值
+                latest_row = df_research.iloc[0]
+                eps_25 = str(latest_row.get("2025-盈利预测-收益", "")).strip()
+                eps_26 = str(latest_row.get("2026-盈利预测-收益", "")).strip()
+                
+                if eps_25 and eps_25 != "nan":
+                    # 存在 EPS 预期
+                    report_title_short = str(latest_row.get('报告名称', '近期研报'))[:15]
+                    obj.eps_forecast = f"《{report_title_short}...》预期EPS: 2025年({eps_25}元)"
+                    if eps_26 and eps_26 != "nan":
+                        obj.eps_forecast += f" / 2026年({eps_26}元)"
+                    logger.info("[EPS DEBUG] Set EPS to: %s", obj.eps_forecast)
                 else:
-                    obj.eps_forecast = "无研报覆盖"
+                    obj.eps_forecast = "近期研报摘要中未显式提及EPS预期，详见本地下载的研报原件"
+                    logger.info("[EPS DEBUG] Set EPS to: %s", obj.eps_forecast)
+            else:
+                obj.eps_forecast = "无研报覆盖"
+                logger.info("[EPS DEBUG] Set EPS to: 无研报覆盖")
         except Exception as e:
-            logger.warning("[EPS预测] %s 获取失败: %s", code, e)
+            # V8.13 护盾：静默降级研报接口报错，防止满屏红字引起恐慌
+            logger.warning("[研报摘要] %s 获取个股研报失败 (可能被极端封禁断网)", code)
+            obj.eps_forecast = "[获取券商研报失败：API遭极端封禁]"
+            try:
+                # 降级：新浪财务接口 (提取基础每股收益)
+                df_sina_profit = ak.stock_financial_report_sina(stock=code, symbol="利润表")
+                if df_sina_profit is not None and not df_sina_profit.empty and "报表项目" in df_sina_profit.columns:
+                    eps_series = df_sina_profit[df_sina_profit["报表项目"] == "基本每股收益(元)"]
+                    if not eps_series.empty:
+                        # 获取非空的第一列（除指标外的最新日期列）
+                        val_cols = [c for c in eps_series.columns if c != "报表项目"]
+                        for col in val_cols:
+                            raw_eps = eps_series.iloc[0][col]
+                            if pd.notna(raw_eps) and str(raw_eps).strip() != "":
+                                sina_eps = _safe_float(raw_eps)
+                                obj.eps_forecast = f"EPS_TTM: {sina_eps:.2f}元 (新浪降级获取)"
+                                # 存入一个隐藏属性供反算 PE 使用
+                                obj._sina_eps_for_calc = sina_eps
+                                break
+                    if obj.eps_forecast in ["提取失败", "无研报覆盖"]:
+                        obj.eps_forecast = "数据暂缺 (新浪亦无数据)"
+            except Exception as sina_e:
+                logger.warning("[EPS预测] 新浪降级也失败: %s", sina_e)
+                obj.eps_forecast = "数据暂缺"
 
         # 2. 股东户数提取
         try:
-            df_gdhs = ak.stock_zh_a_gdhs(symbol=code)
+            df_gdhs = ak.stock_zh_a_gdhs_detail_em(symbol=code)
             if df_gdhs is not None and not df_gdhs.empty:
-                if "数据日期" in df_gdhs.columns:
-                    df_gdhs = df_gdhs.sort_values(by="数据日期", ascending=False)
-                if len(df_gdhs) >= 2:
-                    current_holders = _safe_float(df_gdhs.iloc[0].get("本次户数", 0))
-                    prev_holders = _safe_float(df_gdhs.iloc[1].get("本次户数", 0))
-                    if current_holders > 0 and prev_holders > 0:
-                        change_pct = (current_holders - prev_holders) / prev_holders * 100
-                        trend_desc = "筹码分散" if change_pct > 0 else "筹码集中"
-                        obj.holder_trend = f"最新 {current_holders / 10000:.1f}万户，较上期{'增加' if change_pct > 0 else '下降'} {abs(change_pct):.1f}% ({trend_desc})"
-                elif len(df_gdhs) == 1:
-                    current_holders = _safe_float(df_gdhs.iloc[0].get("本次户数", 0))
-                    obj.holder_trend = f"最新 {current_holders / 10000:.1f}万户 (无上期数据比对)"
+                # 兼容多种可能的列名
+                holder_col = next((col for col in ['股东户数-本次', '本次户数', '股东户数'] if col in df_gdhs.columns), None)
+                change_col = next((col for col in ['股东户数-增减比例', '户数变化比例', '本次变动比例', '变动比例'] if col in df_gdhs.columns), None)
+                
+                if holder_col:
+                    current_holders = _safe_float(df_gdhs.iloc[0].get(holder_col, 0))
+                    if len(df_gdhs) >= 2 and change_col:
+                        change_pct = _safe_float(df_gdhs.iloc[0].get(change_col, 0))
+                        trend_desc = "筹码分散" if change_pct > 0 else ("筹码集中" if change_pct < 0 else "筹码不变")
+                        obj.holder_trend = f"最新 {current_holders / 10000:.1f}万户，较上期变动 {change_pct:.2f}% ({trend_desc})"
+                    elif len(df_gdhs) >= 2:
+                        prev_holders = _safe_float(df_gdhs.iloc[1].get(holder_col, 0))
+                        if current_holders > 0 and prev_holders > 0:
+                            change_pct = (current_holders - prev_holders) / prev_holders * 100
+                            trend_desc = "筹码分散" if change_pct > 0 else "筹码集中"
+                            obj.holder_trend = f"最新 {current_holders / 10000:.1f}万户，较上期{'增加' if change_pct > 0 else '下降'} {abs(change_pct):.1f}% ({trend_desc})"
+                        else:
+                            obj.holder_trend = f"最新 {current_holders / 10000:.1f}万户 (无上期数据比对)"
+                    else:
+                        obj.holder_trend = f"最新 {current_holders / 10000:.1f}万户 (无上期数据比对)"
         except Exception as e:
             logger.warning("[股东户数] %s 获取失败: %s", code, e)
+
+    # 辅助闭包：补充主营业务 (V8.11)
+    def _enrich_core_business(obj: StockInfo):
+        try:
+            df_profile = ak.stock_profile_cninfo(symbol=code)
+            if df_profile is not None and not df_profile.empty:
+                biz = str(df_profile["主营业务"].values[0]) if "主营业务" in df_profile.columns else ""
+                obj.core_business = biz.strip()
+        except Exception as e:
+            logger.debug("[主营业务] %s 提取失败: %s", code, e)
+            obj.core_business = "暂缺"
 
     # -------------------------------------------------------------------------
     # ★ 主力源 (V8.4): PyTDX TCP 直连券商主站（降维打击，无视 HTTP WAF）
@@ -374,9 +444,21 @@ def fetch_stock_info(code: str) -> StockInfo:
                 pb=pb_val,
                 total_mv=total_mv_val,
             )
-            logger.info("[行情] [★ PyTDX直连] %s(%s) 获取成功。", stock_info_obj.name, code)
+            
             _enrich_financials(stock_info_obj)
             _enrich_advanced_fundamentals(stock_info_obj)
+            _enrich_core_business(stock_info_obj)
+
+            # --- 终极防御：EPS反算PE ---
+            if stock_info_obj.pe_ttm == "N/A" and hasattr(stock_info_obj, "_sina_eps_for_calc") and stock_info_obj._sina_eps_for_calc > 0:
+                try:
+                    calc_pe = _safe_numeric(stock_info_obj.price / stock_info_obj._sina_eps_for_calc)
+                    stock_info_obj.pe_ttm = calc_pe
+                    logger.info("[估值兜底] 靠新浪EPS手工反算 %s PE = %s", code, calc_pe)
+                except Exception:
+                    pass
+
+            logger.info("[行情] [★ PyTDX直连] %s(%s) 获取成功。", stock_info_obj.name, code)
             return stock_info_obj
     except Exception as exc:
         logger.warning("[行情] [PyTDX直连] %s 失败，降级到腾讯 HTTP: %s", code, exc)
@@ -409,6 +491,18 @@ def fetch_stock_info(code: str) -> StockInfo:
                 )
                 logger.info("[行情] [腾讯Primary] %s(%s) 获取成功。", stock_info_obj.name, code)
                 _enrich_financials(stock_info_obj)
+                _enrich_advanced_fundamentals(stock_info_obj)
+                _enrich_core_business(stock_info_obj)
+                
+                # --- 终极防御：EPS反算PE ---
+                if stock_info_obj.pe_ttm == "N/A" and hasattr(stock_info_obj, "_sina_eps_for_calc") and stock_info_obj._sina_eps_for_calc > 0:
+                    try:
+                        calc_pe = _safe_numeric(stock_info_obj.price / stock_info_obj._sina_eps_for_calc)
+                        stock_info_obj.pe_ttm = calc_pe
+                        logger.info("[估值兜底] 靠新浪EPS手工反算 %s PE = %s", code, calc_pe)
+                    except Exception:
+                        pass
+                
                 return stock_info_obj
     except Exception as exc:
         logger.warning("[行情] [腾讯Primary] %s 解析失败，准备降级: %s", code, exc)
@@ -463,6 +557,8 @@ def fetch_stock_info(code: str) -> StockInfo:
                 )
                 logger.info("[行情] [东财Fallback] %s(%s) 获取成功。", stock_info_obj.name, code)
                 _enrich_financials(stock_info_obj)
+                _enrich_advanced_fundamentals(stock_info_obj)
+                _enrich_core_business(stock_info_obj)
                 return stock_info_obj
     except Exception as exc:
         logger.error("[行情] [东财Fallback] %s 彻底失败: %s", code, exc)
@@ -504,6 +600,41 @@ def fetch_kline_extremes(code: str, stock_info: StockInfo) -> StockInfo:
     Returns:
         修改后的 StockInfo（历史分位字段已回填）；若接口失败则原样返回。
     """
+    # ── V8.13 提效：PyTDX 极速 K 线绝对首发 ──
+    try:
+        tdx_bars = get_tdx_kline_bars(code, count=800)
+        if tdx_bars:
+            tdx_lows = [bar["low"] for bar in tdx_bars if bar["low"] > 0]
+            tdx_highs = [bar["high"] for bar in tdx_bars if bar["high"] > 0]
+            
+            if tdx_lows:
+                p_now = stock_info.price
+                p_min_3y = min(tdx_lows)
+                p_max_3y = max(tdx_highs)
+
+                price_percentile = (
+                    (p_now - p_min_3y) / (p_max_3y - p_min_3y) * 100
+                    if p_max_3y != p_min_3y else 0.0
+                )
+                rise_from_bottom = (
+                    (p_now - p_min_3y) / p_min_3y * 100 if p_min_3y > 0 else 0.0
+                )
+
+                stock_info.min_price_3y = round(p_min_3y, 2)
+                stock_info.price_percentile = round(price_percentile, 1)
+                stock_info.rise_from_bottom = round(rise_from_bottom, 1)
+
+                logger.info(
+                    "[K线] [★ PyTDX兆底] %s: %d 条日线 | 最低=%.2f | 分位=%.1f%% | 反弹=%.1f%%",
+                    code, len(tdx_bars), p_min_3y, price_percentile, rise_from_bottom
+                )
+                # TDX 没有准确的高频换手率供预警计算，但速度极快，直接返回基本通过测试
+                return stock_info
+    except Exception as exc:
+        logger.error("[K线] [★ PyTDX] %s 初始获取失败: %s，降级东财 HTTP", code, exc)
+
+    # ── 降级备胎：东财 HTTP 接口 ──
+    logger.warning("[K线] %s TDX 取数失败或异常，降级请求东财...", code)
     market_prefix: str = _get_market_prefix(code)
     secid: str = f"{market_prefix}.{code}"
 
@@ -590,45 +721,12 @@ def fetch_kline_extremes(code: str, stock_info: StockInfo) -> StockInfo:
                                 "[风控] %s 触发死亡换手红线: %.1f%%", code, max_turnover_5d,
                             )
             else:
-                logger.warning("[K线] %s: 东财返回无 K 线数据，尝试 TDX 兜底...", code)
+                logger.warning("[K线] %s: 东财返回无 K 线数据", code)
         else:
-            logger.warning("[K线] %s: safe_request 返回 None，尝试 TDX 兜底...", code)
+            logger.warning("[K线] %s: safe_request 返回 None", code)
 
     except Exception as exc:
         logger.error("[K线] %s 东财 HTTP 历史分位计算失败: %s", code, exc)
-
-    # ── V8.4 PyTDX K线兆底：如果东财 HTTP 失败且分位未计算，尝试 TCP 直连 ──
-    if stock_info.min_price_3y == 0.0:
-        try:
-            tdx_bars = get_tdx_kline_bars(code, count=800)
-            if tdx_bars:
-                tdx_lows = [bar["low"] for bar in tdx_bars if bar["low"] > 0]
-                tdx_highs = [bar["high"] for bar in tdx_bars if bar["high"] > 0]
-                tdx_turnovers_raw = []  # TDX K线不含换手率
-                
-                if tdx_lows:
-                    p_now = stock_info.price
-                    p_min_3y = min(tdx_lows)
-                    p_max_3y = max(tdx_highs)
-
-                    price_percentile = (
-                        (p_now - p_min_3y) / (p_max_3y - p_min_3y) * 100
-                        if p_max_3y != p_min_3y else 0.0
-                    )
-                    rise_from_bottom = (
-                        (p_now - p_min_3y) / p_min_3y * 100 if p_min_3y > 0 else 0.0
-                    )
-
-                    stock_info.min_price_3y = round(p_min_3y, 2)
-                    stock_info.price_percentile = round(price_percentile, 1)
-                    stock_info.rise_from_bottom = round(rise_from_bottom, 1)
-
-                    logger.info(
-                        "[K线] [★ PyTDX兆底] %s: %d 条日线 | 最低=%.2f | 分位=%.1f%% | 反弹=%.1f%%",
-                        code, len(tdx_bars), p_min_3y, price_percentile, rise_from_bottom,
-                    )
-        except Exception as exc:
-            logger.warning("[K线] [PyTDX兆底] %s 也失败: %s", code, exc)
 
     return stock_info
 
@@ -652,7 +750,7 @@ def fetch_market_volume() -> float:
             "fltt": 2,
             "invt": 2,
             "fields": "f12,f6",        # f12=代码, f6=全天成交额
-            "secids": "1.000001,0.399001,1.000016,0.399006",
+            "secids": "1.000001,0.399106",  # V8.11: 严格取上证指数 + 深证综指
             "ut": EM_MKT_UT_TOKEN,
         }
         resp = safe_request(
@@ -671,7 +769,7 @@ def fetch_market_volume() -> float:
         )
         total_vol_tr: float = total_vol_yuan / 1e12  # 转换为万亿
 
-        logger.info("[大盘] 今日总成交额: %.2f 万亿", total_vol_tr)
+        logger.info("[大盘] 今日两市总成交额: %.2f 万亿", total_vol_tr)
         return total_vol_tr
 
     except Exception as exc:

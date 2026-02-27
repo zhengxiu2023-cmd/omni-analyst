@@ -158,12 +158,17 @@ def generate_panel_markdown(
     
     # Defaults
     eps_placeholder = "[API获取失败/暂缺]"
+    old_eps_placeholders = ["[API获取失败/暂缺]", "预测EPS: 需参考券商研报原件 (接口已停用)"]
     product_placeholder = "[用户填写，如：主营产品价格近一月暴涨20% / 价格持续阴跌 / 产销持平]"
     holder_placeholder = "[API获取失败/暂缺]"
     
-    # catalyst
+    # catalyst (V8.11: 注入主营业务垫底)
     clean_radar = radar_summary.strip('\n ') if radar_summary else ""
-    catalyst_val = f"\n{clean_radar}" if clean_radar else "[用户可选填]"
+    base_catalyst = f"主营业务: {stock_info.core_business}\n" if hasattr(stock_info, "core_business") and stock_info.core_business else ""
+    if clean_radar:
+        catalyst_val = f"\n{base_catalyst}{clean_radar}"
+    else:
+        catalyst_val = f"\n{base_catalyst}[近期无舆情爆发，请结合盘面或自行补充]"
 
     # If holder config is empty, fallback to placeholder
     eps_val = stock_info.eps_forecast if stock_info.eps_forecast not in ["提取失败", ""] else eps_placeholder
@@ -276,9 +281,13 @@ def generate_panel_markdown(
         # Merge logic for low confidence
         if not is_high_conf and key in old_fields:
             old_val = old_fields[key]
-            # If user modified the field (not placeholder anymore)
-            if old_val and placeholder and placeholder not in old_val:
-                final_val = old_val
+            # V8.11 Fix: specifically override old defunct EPS placeholders
+            if "EPS" in key:
+                if old_val and not any(p in old_val for p in old_eps_placeholders):
+                    final_val = old_val
+            else:
+                if old_val and placeholder and placeholder not in old_val:
+                    final_val = old_val
 
         # Add to lines
         # Special logic to prevent double suffix if old_val actually contains the suffix already, 

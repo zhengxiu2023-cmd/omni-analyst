@@ -88,6 +88,7 @@ def download_company_reports(
         # 竞对股：仅聚焦年度报告和投资者关系纪录
         _download_category(code, name, CNINFO_CATEGORIES["ANNUAL_REPORT"], 1, save_dir)
         _download_category(code, name, category="", limit=3, save_dir=save_dir, searchkey="调研", use_investor_filter=True)
+    else:
         # 目标股：年度、半年度、三季度、一季度各1份，以及调研纪要
         _download_category(code, name, CNINFO_CATEGORIES["ANNUAL_REPORT"], 1, save_dir)
         _download_category(code, name, CNINFO_CATEGORIES["SEMI_ANNUAL"], 1, save_dir)
@@ -140,29 +141,47 @@ def _get_org_id(code: str) -> str:
             data={"keyWord": code},
             headers=API_CONFIG["HEADERS"],
         )
-        if resp is None:
-            return ""
+        if resp is not None:
+            results: list[dict] = resp.json()
+            if results:
+                # 精确匹配 code，提取 orgId
+                for item in results:
+                    if item.get("code") == code:
+                        org_id: str = item.get("orgId", "")
+                        _org_cache[code] = org_id
+                        return org_id
 
-        results: list[dict] = resp.json()
-        if not results:
-            logger.warning("[巨潮] %s topSearch 未返回任何结果", code)
-            return ""
-
-        # 精确匹配 code，提取 orgId
-        for item in results:
-            if item.get("code") == code:
-                org_id: str = item.get("orgId", "")
+                # 若未精确匹配，默认取第一条
+                org_id = results[0].get("orgId", "")
                 _org_cache[code] = org_id
                 return org_id
-
-        # 若未精确匹配，默认取第一条
-        org_id = results[0].get("orgId", "")
-        _org_cache[code] = org_id
-        return org_id
-
+            
     except Exception as exc:
-        logger.error("[巨潮] orgId 获取失败(%s): %s", code, exc)
-        return ""
+        logger.warning("[巨潮] topSearch 动态查询失败(%s): %s", code, exc)
+
+    # --- 终极防御：如果 topSearch 挂了，请求全网公开未设防的 JSON 字典 ---
+    try:
+        logger.info("[巨潮] 启用顶级降级策略，去静态字典中打捞 %s orgId", code)
+        static_resp = safe_request(
+            "http://www.cninfo.com.cn/new/data/szse_stock.json",
+            method="get",
+            headers=API_CONFIG["HEADERS"]
+        )
+        if static_resp is not None:
+            data = static_resp.json()
+            stock_list = data.get("stockList", [])
+            for item in stock_list:
+                if str(item.get("code")) == str(code):
+                    org_id = item.get("orgId", "")
+                    _org_cache[code] = org_id
+                    logger.info("[巨潮] 静态降级打捞成功: %s -> %s", code, org_id)
+                    return org_id
+                    
+    except Exception as fallback_exc:
+        logger.error("[巨潮] 终极静态 JSON 兜底也失败了(%s): %s", code, fallback_exc)
+        
+    logger.error("[巨潮] 无法获取 orgId，该股后续底稿下载将被强行跳过。")
+    return ""
 
 
 # ===========================================================================
@@ -285,6 +304,8 @@ def _download_category(
         if os.path.exists(pdf_path):
             logger.info("[巨潮] ⏭️  已存在，跳过: %s", clean_title[:50])
             downloaded_count += 1
+            if downloaded_count >= limit:
+                return True
             continue
 
         # ── 流式下载（防 OOM 核心）──
@@ -322,6 +343,9 @@ def _download_category(
             )
 
             downloaded_count += 1
+            if downloaded_count >= limit:
+                logger.debug("[巨潮] 达到 limit=%d 限制，强制跳出 %s 检索流", limit, category)
+                return True
 
         except Exception as exc:
             logger.error("[巨潮] %s 写入失败: %s", clean_title[:50], exc)

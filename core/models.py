@@ -36,6 +36,7 @@ class StockInfo:
     # --- 财务进阶指标（由 fetchers 填充，默认缺省）---
     roe: Union[str, float] = "N/A"       # 净资产收益率（%）
     gross_margin: Union[str, float] = "N/A" # 毛利率（%）
+    core_business: str = ""              # 主营业务描述（V8.11 新增兜底项）
 
     # --- 历史穿透字段（由 kline 数据计算后回填，初始有默认值）---
     min_price_3y: float = 0.0            # 近 3 年最低价（前复权），用于底部计算

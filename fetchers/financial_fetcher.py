@@ -10,6 +10,9 @@
 
 import logging
 import os
+import json
+import re
+import requests
 import pandas as pd
 import akshare as ak
 from typing import List, Tuple
@@ -17,9 +20,10 @@ import time
 import random
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from config import EXPORT_CONFIG
+from config import EXPORT_CONFIG, LLM_CONFIG
 
 from core.models import CompetitorFinancials
+from core.network_engine import safe_request
 from fetchers.cninfo_spider import download_company_reports, download_industry_reports
 
 logger = logging.getLogger(__name__)
@@ -38,7 +42,7 @@ def _safe_float_str(val, default="N/A") -> str:
     wait=wait_exponential(multiplier=1.5, min=2, max=10),
     reraise=True
 )
-def _get_target_industry_peers(stock_code: str, top_n: int = 2) -> Tuple[List[dict], str]:
+def _get_target_industry_peers(stock_code: str, stock_name: str = "", top_n: int = 2, core_business: str = "") -> Tuple[List[dict], str]:
     """
     寻找同板块市值最近的竞对标的，并返回板块名称。
     """
@@ -85,17 +89,114 @@ def _get_target_industry_peers(stock_code: str, top_n: int = 2) -> Tuple[List[di
             ths_board_df = ak.stock_board_industry_name_ths()
             if ths_board_df is not None and not ths_board_df.empty:
                 # 为了防爆主流程并且确保性能，一旦东财接口崩溃，且为了彻底消灭幻觉兜底：
-                # 我们不再伪造 THS 数据，而是直接安全向下传递空数组，面板通过 Markdown 优雅降级。
-                logger.info("[竞对发现] 东财获取竞对崩溃，THS兜底亦不再伪造对象，触发最高级别空值降级主流程...")
-                return [], ""
+                logger.info("[竞对发现] 东财获取竞对崩溃，触发 THS 降级...")
         except Exception as ths_exc:
             logger.warning("[竞对发现] 同花顺接口兜底同样失败: %s", ths_exc)
 
+        # -------------------------------------------------------------
+        # 颠覆式兜底机制：本地 LLM 大模型推理找竞对 
+        # -------------------------------------------------------------
+        logger.warning("[竞对发现] 传统爬虫全线溃败，唤醒本地 LLM(%s) 引擎进行知识推理找平...", LLM_CONFIG.get("MODEL_NAME", "unknown"))
+        llm_peers = _ask_llm_for_peers(stock_code, stock_name, core_business)
+        if llm_peers:
+            return llm_peers[:top_n], "AI推理板块"
+        
         return [], ""
         
     except Exception as exc:
-        logger.error("[竞对发现-系统级保护] 寻找 %s 的竞对彻底崩溃，安全阻断: %s", stock_code, exc)
+        logger.warning("[竞对发现-系统级保护] 寻找 %s 的竞对彻底崩溃，安全阻断: %s", stock_code, exc)
         return [], ""
+
+def _ask_llm_for_peers(stock_code: str, stock_name: str, core_business: str = "") -> List[dict]:
+    """
+    使用本地 Ollama 进行竞对推理。
+    """
+    if not LLM_CONFIG.get("ENABLE", True):
+        logger.debug("[LLM竞对] LLM功能未开启，放弃推理。")
+        return []
+        
+    business_anchor = core_business[:100] if core_business else "暂无"
+
+    prompt = f"""你是一个顶级的A股分析师。目标公司是【{stock_name}({stock_code})】。
+该公司的核心主营业务是：【{business_anchor}】。
+
+请严格基于上述主营业务，找出它在A股市场中最核心的1到2家**直接竞争对手**。
+⚠️ 严厉警告：竞对必须是卖同类产品或提供同类服务的同行！绝不能把它的上游供应商或下游客户当成竞对（例如严禁将造船制造业和航运运输业混淆）。
+
+必须严格以JSON数组格式返回，格式如下：
+[{{"code": "6位数字股票代码", "name": "股票简称"}}]
+如果你不知道，或者它没有主营业务高度重合的A股竞对，请直接返回空数组 []。不要输出任何其他废话。"""
+    
+    payload = {
+        "model": LLM_CONFIG["MODEL_NAME"],
+        "prompt": prompt,
+        "stream": False,
+        "format": "json"
+    }
+    
+    try:
+        resp = requests.post(LLM_CONFIG["OLLAMA_API"], json=payload, timeout=LLM_CONFIG["TIMEOUT"] + 10)
+        resp.raise_for_status()
+        raw_text = resp.json().get("response", "").strip()
+        
+        # 尝试找出最外层的 [] 或 {}
+        start_idx = raw_text.find('[')
+        end_idx = raw_text.rfind(']')
+        if start_idx == -1 or end_idx == -1:
+            start_idx = raw_text.find('{')
+            end_idx = raw_text.rfind('}')
+            
+        if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
+            clean_json = raw_text[start_idx:end_idx+1].strip()
+            data = json.loads(clean_json)
+            
+            # 兼容模型只返回单个 { "code": "", "name": "" } 对象的错觉
+            if isinstance(data, dict):
+                data = [data]
+                
+            if isinstance(data, list):
+                valid_peers = []
+                # V8.13: 使用腾讯实盘接口作为终极测谎仪
+                for item in data:
+                    if isinstance(item, dict) and "code" in item:
+                        peer_code = str(item["code"]).strip()
+                        if not peer_code or len(peer_code) != 6 or not peer_code.isdigit():
+                            continue
+                            
+                        # 根据 6 开头判断市场前缀 (简易区分 sh/sz)
+                        prefix = "sh" if peer_code.startswith("6") else "sz"
+                        req_url = f"http://qt.gtimg.cn/q={prefix}{peer_code}"
+                        
+                        try:
+                            # 腾讯接口极速返回，极少封禁
+                            resp = safe_request(req_url, method="get", timeout=2)
+                            if resp and resp.text:
+                                text = resp.text.strip()
+                                # 正常的返回如: v_sh601919="1~中远海控~601919~...
+                                if "=" in text and "~" in text:
+                                    parts = text.split("=")
+                                    if len(parts) == 2:
+                                        data_str = parts[1].strip('";')
+                                        fields = data_str.split("~")
+                                        if len(fields) > 2:
+                                            real_name = str(fields[1]).strip()
+                                            
+                                            logger.info("[LLM竞对] 腾讯接口测谎通过！代码 %s 真实名称锁定为: 【%s】", peer_code, real_name)
+                                            valid_peers.append({"code": peer_code, "name": real_name})
+                                            continue
+                                            
+                            logger.warning("[LLM竞对] [幻觉拦截] 腾讯接口查无此代码或返回异常，剔除假代码: %s", peer_code)
+                        except Exception as e:
+                            logger.error("[LLM竞对] 腾讯验证接口请求异常: %s", e)
+                                    
+                if valid_peers:
+                    logger.info("[LLM竞对] 原生+去伪推理出最终竞对: %s", valid_peers)
+                    return valid_peers
+        logger.warning("[LLM竞对] 格式解析失败或模型未给出合格竞对，原样返回空: %s", raw_text[:100])
+        return []
+    except Exception as e:
+        logger.warning("[LLM竞对] 模型引擎推理失败: %s", e)
+        return []
 
 def _fetch_single_8q(stock_code: str) -> dict:
     """提取单只股票最近 8 期的核心利润/资产/现金流切片。"""
@@ -170,7 +271,7 @@ def _fetch_single_8q(stock_code: str) -> dict:
         
     return result
 
-def fetch_target_and_peers_financials(target_code: str, target_name: str, save_dir: str = None) -> Tuple[List[CompetitorFinancials], List[str]]:
+def fetch_target_and_peers_financials(target_code: str, target_name: str, save_dir: str = None, core_business: str = "") -> Tuple[List[CompetitorFinancials], List[str]]:
     """
     拉取目标公司及其 1-2 位板块竞对的最近 8 期主要财务表指标，并联动下载目标、竞对及行业板块高价值深度研报。防爆捕获，失败不可阻断主流程。
     """
@@ -195,7 +296,7 @@ def fetch_target_and_peers_financials(target_code: str, target_name: str, save_d
             logger.error("[容灾] 目标自身 PDF 下载异常: %s", e)
         
     # 2. 挖掘竞对并提取 8 期
-    peers, industry_name = _get_target_industry_peers(target_code, top_n=2)
+    peers, industry_name = _get_target_industry_peers(target_code, target_name, top_n=2, core_business=core_business)
     for peer in peers:
         peer_code = peer["code"]
         peer_name = peer["name"]

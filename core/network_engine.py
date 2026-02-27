@@ -62,7 +62,7 @@ def safe_request(
     """
     # 读取配置：重试次数和超时时间
     max_retries: int = API_CONFIG.get("REQUEST_RETRIES", 3)
-    timeout: int = API_CONFIG.get("STREAM_TIMEOUT", 30) if stream else API_CONFIG.get("DEFAULT_TIMEOUT", 10)
+    timeout: int = kwargs.pop("timeout", API_CONFIG.get("STREAM_TIMEOUT", 30) if stream else API_CONFIG.get("DEFAULT_TIMEOUT", 10))
 
     # 如果调用方未显式传入 headers，使用 config 中的默认浏览器 UA 或生成一个
     if headers is None:

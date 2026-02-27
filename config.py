@@ -106,8 +106,9 @@ API_CONFIG: dict = {
     },
 
     # --- 超时与重试配置 ---
-    "REQUEST_RETRIES": 3,      # 防御性编程：网络请求最大重试次数
-    "STREAM_TIMEOUT": 60,      # 流式大文件下载超时 (秒)，对应 PDF chunk 下载
+    "MAX_RETRIES": 3,
+    "RETRY_BACKOFF": 1.5,
+    "STREAM_TIMEOUT": 120,    # V8.13 护盾：大文件下载流式超时 (秒) 扩大以防挂死
     "DEFAULT_TIMEOUT": 15,     # 常规 API 请求超时 (秒)
     "LLM_HEALTH_TIMEOUT": 1,   # Ollama 健康检查的超时 (秒)，快速判断是否可用
 }

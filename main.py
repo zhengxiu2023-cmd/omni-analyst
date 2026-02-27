@@ -366,7 +366,12 @@ def _audit_single_stock(code: str, market_vol: float) -> None:
     comp_financials = []
     industry_reports_text = []
     try:
-        comp_financials, industry_reports_text = fetch_target_and_peers_financials(target_code=code, target_name=stock_info.name, save_dir=save_dir)
+        comp_financials, industry_reports_text = fetch_target_and_peers_financials(
+            target_code=code, 
+            target_name=stock_info.name, 
+            save_dir=save_dir,
+            core_business=stock_info.core_business
+        )
         competitors_summary = _format_competitors_to_md(comp_financials, industry_reports_text)
     except Exception as e:
         logger.error(f"[竞对横评] 提取失败: {e}")
@@ -374,7 +379,9 @@ def _audit_single_stock(code: str, market_vol: float) -> None:
 
     # ── Step 8: PDF RAG 提取（仅对年报/调研类）──
     print(f"\n  🔬 [Step 8/8] 扫描 PDF 目录，提取增量 RAG 硬核信号...")
-    rag_sentences: list[str] = _extract_rag_from_dir(save_dir)
+    # V8.13: 靶向提取，防老文件污染
+    peer_names = [res.name for res in comp_financials if res.code != "000001" and res.code != code]
+    rag_sentences: list[str] = _extract_rag_from_dir(save_dir, stock_info.name, peer_names)
     if rag_sentences:
         print(f"  ✅  共提取 {len(rag_sentences)} 条关键句。")
     else:
@@ -458,18 +465,26 @@ def _format_competitors_to_md(comp_financials: list[CompetitorFinancials], indus
 # ===========================================================================
 # 辅助：扫描目录提取所有 PDF 的 RAG 信息
 # ===========================================================================
-def _extract_rag_from_dir(save_dir: str) -> list[str]:
+def _extract_rag_from_dir(save_dir: str, target_name: str, peer_names: list[str]) -> list[str]:
     """
     扫描 save_dir 目录下所有 PDF 文件，仅对年报/调研类执行 RAG 提取，
-    汇总返回去重后的关键句列表。
+    汇总返回去重后的关键句列表。增加靶向防护，剥离污染的冗余文件。
     """
     all_sentences: list[str] = []
     seen: set[str] = set()
+    
+    # 建立准入白名单
+    valid_names = [target_name] + peer_names
 
     try:
         for filename in os.listdir(save_dir):
             if not filename.endswith(".pdf"):
                 continue
+            
+            # V8.13 护盾：剔除名字完全不在白名单中的遗留垃圾 PDF
+            if not any(n in filename for n in valid_names):
+                continue
+                
             # 仅对年报和调研类做 RAG 提取，跳过季报（低价值噪音多）
             if not any(kw in filename for kw in ("年报", "年度", "调研")):
                 continue
